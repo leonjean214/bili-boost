@@ -1,0 +1,7 @@
+# 这个目录同时是 Userscripts 的 save location，可能放着其它与本仓库无关的脚本。
+# 用白名单模式，只跟踪本项目的文件。
+*
+!.gitignore
+!README.md
+!LICENSE
+!bili-cdn-fix.user.js
