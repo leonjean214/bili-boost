@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         哔哩哔哩播放优化（CDN 测速切源 + 强制硬解编码）
 // @namespace    https://github.com/leonjean214/bili-boost
-// @version      1.0.0
+// @version      1.0.1
 // @description  CDN 两阶段测速切源，并剔除 AV1、优先 HEVC/H.264，降低海外播放卡顿与软解发热。
 // @author       leonjean214
 // @match        *://*.bilibili.com/*
@@ -534,9 +534,14 @@
     if (box) return box;
     box = document.createElement('div');
     box.id = 'bili-boost-hud';
-    box.style.cssText = 'position:fixed;right:12px;bottom:12px;z-index:2147483647;background:rgba(20,20,22,.88);' +
+    // 背景必须足够不透明：早期版本用 .88，B站页面的评论/推荐标题会透上来，
+    // 看着像是出现了第二个 HUD。backdrop-filter 在 Safari 必须带 -webkit- 前缀，
+    // 而且不能只依赖它 —— 不生效时要靠不透明度兜底。
+    box.style.cssText = 'position:fixed;right:12px;bottom:12px;z-index:2147483647;background:rgba(18,18,20,.97);' +
+      '-webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px);' +
       'color:#ddd;font:11px/1.55 ui-monospace,Menlo,monospace;padding:6px 10px;border-radius:7px;' +
-      'box-shadow:0 3px 14px rgba(0,0,0,.4);white-space:pre;transition:opacity .4s;cursor:pointer;user-select:none';
+      'border:1px solid rgba(255,255,255,.08);' +
+      'box-shadow:0 3px 14px rgba(0,0,0,.5);white-space:pre;transition:opacity .4s;cursor:pointer;user-select:none';
     box.addEventListener('click', event => {
       const action = event.target.closest('[data-action]')?.dataset.action;
       if (action === 'prefer') {
