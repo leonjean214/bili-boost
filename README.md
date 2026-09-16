@@ -141,6 +141,11 @@ Safari 没有油猴。用 App Store 上免费的 [Userscripts](https://apps.appl
 
 > 编辑器页面右侧显示 `No Item Selected` 是正常的占位文案，只表示你还没点左侧列表里的脚本。真正表示没找到脚本的文案是 `No valid files found in directory`。
 
+**Safari 的两个注意点**（都已实测）：
+
+- 脚本必须同时带 `@grant none` 和 `@inject-into page`。Userscripts 对 `@grant none` 的默认处理**和 Tampermonkey 相反** —— 它会注入到 content 隔离世界，那样劫持 `fetch` / `MediaSource` / `__playinfo__` 对页面**全部无效**。`@inject-into page` 才能把它拉回页面世界。
+- CSS 里 `backdrop-filter` 在 Safari 必须写 `-webkit-backdrop-filter`，否则静默不生效。
+
 ---
 
 ## 看它有没有在工作
@@ -281,7 +286,7 @@ SKIPPED  切清晰度                 同上
 
 ### 共同
 
-- **登录态没有覆盖**。上面的回归是未登录跑的，只能到 480P；1080P / 4K / 高码率下的表现、以及 4K HEVC 在 M2 上的 `powerEfficient` 都还没验证过。
+- **自动化回归是未登录跑的**，只能到 480P。登录态 **1080P 已在 Safari 手动实测通过**（HEVC 硬解、CDN 切源、`__biliCdn` 八个接口齐全）；**4K / 高码率仍未覆盖**，尤其 4K HEVC 在 M2 上的 `powerEfficient` 还没验证过。
 - 升级期间若旧的 `bili-cdn-fix` / `bili-hwdecode` 仍启用，会造成重复劫持。脚本自带安装标记只能防自己重复注入，**管不到旧版**，请手动禁用。
 
 ## License
