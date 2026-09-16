@@ -1,14 +1,24 @@
 #!/usr/bin/env node
 
-import { execFile, spawn } from 'node:child_process';
+import { execFile, execFileSync, spawn } from 'node:child_process';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const CHROME = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 const PORT = Number(process.env.BILI_BOOST_QA_PORT || 9333);
 const ROOT = new URL('../', import.meta.url);
+const ROOT_PATH = fileURLToPath(ROOT);
 const USER_SCRIPT = await readFile(new URL('../bili-boost.user.js', import.meta.url), 'utf8');
+let LEGACY_CDN_SCRIPT = null;
+try {
+  LEGACY_CDN_SCRIPT = execFileSync('git', ['show', 'bb6d614:bili-cdn-fix.user.js'], {
+    cwd: ROOT_PATH,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'ignore'],
+  });
+} catch {}
 const results = [];
 let chrome;
 let browserCdp;
@@ -127,10 +137,15 @@ class CDP {
 const OBSERVER = String.raw`
 (() => {
   const qa = window.__qaBoost = {
-    mimes: [], playurl: [], playurlResponses: [], hud: [], errors: [],
+    mimes: [], playurl: [], playurlResponses: [], hud: [], errors: [], warnings: [],
     initialCodecPreference: localStorage.getItem('bilibili_player_codec_prefer_type')
   };
   const remember = (list, value) => { if (value && !list.includes(value)) list.push(value); };
+  const originalWarn = console.warn;
+  console.warn = function(...args) {
+    qa.warnings.push(args.map(value => String(value)).join(' '));
+    return originalWarn.apply(this, args);
+  };
   const isPlayurl = url => /\/playurl/i.test(String(url));
   const summarizePlayurl = (via, payload) => {
     const data = payload && (payload.data || payload.result || payload);
@@ -199,7 +214,7 @@ async function endpoint(path, options) {
   return fetch(`http://127.0.0.1:${PORT}${path}`, options);
 }
 
-async function newPage({ inject = false, injectTwice = false } = {}) {
+async function newPage({ inject = false, injectTwice = false, legacyOrder = null } = {}) {
   const target = await (await endpoint('/json/new?about%3Ablank', { method: 'PUT' })).json();
   const cdp = await CDP.connect(target.webSocketDebuggerUrl);
   await Promise.all([cdp.send('Page.enable'), cdp.send('Runtime.enable')]);
@@ -219,7 +234,12 @@ async function newPage({ inject = false, injectTwice = false } = {}) {
       addSourceBuffer: MediaSource.prototype.addSourceBuffer === window.__qaBoostFirstHooks.addSourceBuffer
     };
   `;
-  const parts = inject ? [OBSERVER, USER_SCRIPT] : [OBSERVER];
+  const parts = [OBSERVER];
+  if (inject) {
+    if (legacyOrder === 'before' && LEGACY_CDN_SCRIPT) parts.push(LEGACY_CDN_SCRIPT);
+    parts.push(USER_SCRIPT);
+    if (legacyOrder === 'after' && LEGACY_CDN_SCRIPT) parts.push(LEGACY_CDN_SCRIPT);
+  }
   if (injectTwice) parts.push(snapshot, USER_SCRIPT, verifyDuplicate);
   const source = validateJavaScript(parts.join('\n'), 'Page.addScriptToEvaluateOnNewDocument');
   await cdp.send('Page.addScriptToEvaluateOnNewDocument', { source });
@@ -252,6 +272,7 @@ async function observation(cdp) {
       playurlResponses: qa.playurlResponses || [],
       hud: qa.hud || [],
       errors: qa.errors || [],
+      warnings: qa.warnings || [],
       initialCodecPreference: qa.initialCodecPreference ?? null,
       body: (document.body?.innerText || '').slice(0, 3000)
     };
@@ -319,10 +340,10 @@ function addResult(name, status, details = {}) {
   results.push({ name, status, codec: details.codec || '—', reason: details.reason || '', powerEfficient: details.powerEfficient });
 }
 
-async function runScenario(name, fn, { inject = name !== '对照组（不注入）', injectTwice = false } = {}) {
+async function runScenario(name, fn, { inject = name !== '对照组（不注入）', injectTwice = false, legacyOrder = null } = {}) {
   let page;
   try {
-    page = await newPage({ inject, injectTwice });
+    page = await newPage({ inject, injectTwice, legacyOrder });
     await fn(page.cdp);
   } catch (error) {
     addResult(name, 'FAIL', { reason: error.message });
@@ -496,6 +517,46 @@ async function main() {
       reason: pass ? '重复执行后 HUD 仍为一个，fetch/open/send/addSourceBuffer 均未再次包装' : JSON.stringify(checked),
     });
   }, { injectTwice: true });
+
+  for (const [legacyOrder, orderLabel] of [['before', '旧版先注入'], ['after', '旧版后注入']]) {
+    const name = `旧版冲突检测（${orderLabel}）`;
+    if (!LEGACY_CDN_SCRIPT) {
+      addResult(name, 'SKIPPED', { reason: '无法从 git 历史读取 bb6d614:bili-cdn-fix.user.js' });
+      continue;
+    }
+    await runScenario(name, async cdp => {
+      await navigate(cdp, 'https://www.bilibili.com/robots.txt');
+      await waitFor(() => cdp.eval(String.raw`(() => {
+        const api = window.__biliBoost;
+        const oldHud = document.getElementById('bili-cdn-hud');
+        const boostHud = document.getElementById('bili-boost-hud');
+        return api?.冲突 && oldHud && boostHud && getComputedStyle(oldHud).display === 'none';
+      })()`), { timeout: 10_000, label: `${orderLabel}的冲突告警和旧 HUD 隐藏` });
+      await cdp.eval("document.getElementById('bili-boost-hud').click()");
+      await sleep(750); // 让现有 500ms 同步再检查一次，顺便验证 console.warn 不会重复。
+      const audit = await cdp.eval(String.raw`(() => {
+        const api = window.__biliBoost;
+        const oldHud = document.getElementById('bili-cdn-hud');
+        const text = document.getElementById('bili-boost-hud')?.textContent || '';
+        return {
+          boostAvailable: !!api,
+          conflict: api?.冲突 || null,
+          oldHudDisplay: oldHud ? getComputedStyle(oldHud).display : null,
+          warningVisible: /旧版 bili-cdn-fix 仍在运行/.test(text),
+          managerLocationsVisible: /Userscripts/.test(text) && /AdGuard/.test(text) && /Tampermonkey/.test(text),
+          warningCount: (window.__qaBoost?.warnings || []).filter(line => /\[bili-boost\] 检测到旧版 bili-cdn-fix/.test(line)).length,
+          aliasOwnedByBoost: window.__biliCdn === api,
+        };
+      })()`);
+      const expectedAliasOwnership = legacyOrder === 'before';
+      const pass = audit.boostAvailable && audit.conflict && audit.oldHudDisplay === 'none' &&
+        audit.warningVisible && audit.managerLocationsVisible && audit.warningCount === 1 &&
+        audit.aliasOwnedByBoost === expectedAliasOwnership;
+      addResult(name, pass ? 'PASS' : 'FAIL', {
+        reason: pass ? '冲突提示可见、展开态列出管理器、旧 HUD 已隐藏、console.warn 仅一次、__biliBoost 仍可用' : JSON.stringify(audit),
+      });
+    }, { legacyOrder });
+  }
 
   await runScenario('playurl 劫持层（mock）', async cdp => {
     await navigate(cdp, ugcUrl);
