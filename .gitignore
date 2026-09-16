@@ -4,4 +4,6 @@
 !.gitignore
 !README.md
 !LICENSE
-!bili-cdn-fix.user.js
+!bili-boost.user.js
+!tools/
+!tools/*.mjs
