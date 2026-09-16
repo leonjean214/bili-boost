@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         哔哩哔哩播放优化（CDN 测速切源 + 强制硬解编码）
 // @namespace    https://github.com/leonjean214/bili-boost
-// @version      1.0.1
+// @version      1.0.3
 // @description  CDN 两阶段测速切源，并剔除 AV1、优先 HEVC/H.264，降低海外播放卡顿与软解发热。
 // @author       leonjean214
 // @match        *://*.bilibili.com/*
@@ -42,6 +42,20 @@
   const VIDEO_PATH = /^\/(video\/|bangumi\/play\/|list\/|festival\/)/;
   const CODEC_NAME = { 7: 'AVC/H.264', 12: 'HEVC/H.265', 13: 'AV1' };
   const AV1 = 13;
+
+  // 本脚本刻意不加 @noframes —— CDN 模块要在 iframe 内嵌播放器里继续生效。
+  // 但 B站有同源 iframe（如登录轮询用的 /correspond/），脚本在里面照样会跑，
+  // 那里既不是视频页也拦不到分片。HUD 必须只由顶层窗口绘制，
+  // 否则 iframe 会画出第二个 HUD，内容是「没拦到分片请求 / 未检测编码」。
+  const SCRIPT_VERSION = 'v1.0.3';   // ⚠️ 改版本时要和文件头的 @version 一起改
+
+  const IS_TOP = (() => { try { return window.top === window.self; } catch (e) { return false; } })();
+
+  // 已确认与媒体无关的同源 iframe 直接退出，连 hook 和定时器都不装。
+  // /correspond/ 是 B站登录态轮询用的，实测就是它画出了第二个 HUD。
+  // 其余未知 iframe 仍保留被动 CDN hook —— 万一里面是内嵌播放器，切源依然要生效。
+  const NON_MEDIA_FRAME = /^\/correspond\//;
+  if (!IS_TOP && NON_MEDIA_FRAME.test(location.pathname)) return;
 
   const origFetch = window.fetch;
   const origOpen = XMLHttpRequest.prototype.open;
@@ -138,11 +152,18 @@
     const next = mediaIdentity();
     if (next !== currentMediaId) resetMediaState('页面切换', next);
   }
-  addEventListener('popstate', syncMediaIdentity);
-  addEventListener('hashchange', syncMediaIdentity);
-  setInterval(syncMediaIdentity, 500);
+  // SPA 路由监听只有顶层需要：iframe 不画 HUD，也不展示媒体态，
+  // 每个 iframe 再起一个 500ms 轮询纯属浪费。
+  if (IS_TOP) {
+    addEventListener('popstate', syncMediaIdentity);
+    addEventListener('hashchange', syncMediaIdentity);
+    setInterval(syncMediaIdentity, 500);
+  }
 
   function scheduleMediaWarning(generation = mediaGeneration) {
+    // 只有顶层视频页才该提示「没拦到分片」。iframe 不显示 HUD，
+    // 非视频页（首页/空间/动态）本来就没有分片请求，报了就是误报。
+    if (!IS_TOP || !isVideoPage()) return;
     setTimeout(() => {
       if (generation !== mediaGeneration || cdnState.sawMedia) return;
       cdnState.missedWarning = true;
@@ -565,6 +586,7 @@
   }
 
   function renderHud(expand) {
+    if (!IS_TOP) return;   // 见 IS_TOP 定义处：iframe 里不画 HUD
     if (!hudOn) return;
     if (!document.body) {
       document.addEventListener('DOMContentLoaded', () => renderHud(expand), { once: true });
@@ -643,7 +665,7 @@
   window.__biliBoost = debugApi;
   window.__biliCdn = debugApi;
 
-  console.log('[bili-boost] v1.0.0 已注入，控制台可用 __biliBoost / __biliCdn 查看状态');
+  console.log('[bili-boost] ' + SCRIPT_VERSION + ' 已注入，控制台可用 __biliBoost / __biliCdn 查看状态');
   renderHud(false);
   scheduleMediaWarning();
 })();
