@@ -201,6 +201,7 @@ __biliBoost.分片明细      // 每片的 host 和速度
 __biliBoost.测速结果      // 完整测速明细，含精测/快筛标记
 __biliBoost.卡顿次数
 __biliBoost.黑名单        // 被 403 / 连不上淘汰的源
+__biliBoost.冲突          // 旧版脚本冲突详情；无冲突时为 null
 __biliBoost.重测()        // 手动重新测速
 __biliBoost.面板(false)   // 关掉右下角 HUD
 ```
@@ -263,6 +264,14 @@ SKIPPED  切清晰度                 同上
 
 ---
 
+## 故障排查
+
+### HUD 提示「旧版 bili-cdn-fix 仍在运行」
+
+这表示旧版脚本仍在另一个脚本管理器中注入，可能造成重复测速、重复改写 CDN 和 HUD 重叠。请分别检查 **Userscripts**、**AdGuard → Extensions**、**Tampermonkey**，禁用或删除 `bili-cdn-fix`；只保留 `bili-boost`，然后完整刷新 B 站页面。新版会隐藏旧 HUD 以免遮挡，但不会尝试拆除旧版已安装的请求 hook。
+
+---
+
 ## 已知局限
 
 ### CDN 模块
@@ -287,7 +296,7 @@ SKIPPED  切清晰度                 同上
 ### 共同
 
 - **自动化回归是未登录跑的**，只能到 480P。登录态 **1080P 已在 Safari 手动实测通过**（HEVC 硬解、CDN 切源、`__biliCdn` 八个接口齐全）；**4K / 高码率仍未覆盖**，尤其 4K HEVC 在 M2 上的 `powerEfficient` 还没验证过。
-- 升级期间若旧的 `bili-cdn-fix` / `bili-hwdecode` 仍启用，会造成重复劫持。脚本自带安装标记只能防自己重复注入，**管不到旧版**，请手动禁用。
+- 升级期间若旧的 `bili-cdn-fix` / `bili-hwdecode` 仍启用，会造成重复劫持。脚本会检测 `bili-cdn-fix`、显示告警并隐藏它的 HUD，但不会拆除旧 hook，仍需按上面的故障排查步骤手动禁用。`bili-hwdecode` 的历史版本没有查到可靠的全局名或 HUD id，因此不做猜测性检测。
 
 ## License
 

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         哔哩哔哩播放优化（CDN 测速切源 + 强制硬解编码）
 // @namespace    https://github.com/leonjean214/bili-boost
-// @version      1.0.3
+// @version      1.0.4
 // @description  CDN 两阶段测速切源，并剔除 AV1、优先 HEVC/H.264，降低海外播放卡顿与软解发热。
 // @author       leonjean214
 // @match        *://*.bilibili.com/*
@@ -47,7 +47,7 @@
   // 但 B站有同源 iframe（如登录轮询用的 /correspond/），脚本在里面照样会跑，
   // 那里既不是视频页也拦不到分片。HUD 必须只由顶层窗口绘制，
   // 否则 iframe 会画出第二个 HUD，内容是「没拦到分片请求 / 未检测编码」。
-  const SCRIPT_VERSION = 'v1.0.3';   // ⚠️ 改版本时要和文件头的 @version 一起改
+  const SCRIPT_VERSION = 'v1.0.4';   // ⚠️ 改版本时要和文件头的 @version 一起改
 
   const IS_TOP = (() => { try { return window.top === window.self; } catch (e) { return false; } })();
 
@@ -95,6 +95,30 @@
     return cdnOn && configGet('hud', true);
   })();
   let hudExpanded = false;
+  let debugApi = null;
+
+  // 旧版会安装自己的 fetch/XHR hook，无法可靠拆除；这里只识别、告警并隐藏旧 HUD。
+  // __biliCdn 可能先被旧版占用，也可能在本脚本设置别名后又被覆盖，所以检测既在
+  // 初始化末尾执行，也复用顶层窗口现有的 500ms 状态同步持续检查。
+  const legacyConflict = { detected: false, signals: new Set(), warned: false };
+  function detectLegacyConflict() {
+    if (!IS_TOP) return false;
+    const wasDetected = legacyConflict.detected;
+    const legacyHud = document.getElementById('bili-cdn-hud');
+    if (legacyHud) {
+      legacyConflict.signals.add('#bili-cdn-hud');
+      legacyHud.style.setProperty('display', 'none', 'important');
+    }
+    if (window.__biliCdn && window.__biliCdn !== debugApi) {
+      legacyConflict.signals.add('window.__biliCdn 指向其他脚本');
+    }
+    legacyConflict.detected = legacyConflict.signals.size > 0;
+    if (legacyConflict.detected && !legacyConflict.warned) {
+      legacyConflict.warned = true;
+      console.warn('[bili-boost] 检测到旧版 bili-cdn-fix 仍在运行；请到 Userscripts / AdGuard → Extensions / Tampermonkey 中停用旧脚本。');
+    }
+    return !wasDetected && legacyConflict.detected;
+  }
 
   function loadGlobalWinner() {
     try {
@@ -149,8 +173,10 @@
     console.log('[bili-boost] 新媒体状态已重置：' + reason);
   }
   function syncMediaIdentity() {
+    const conflictChanged = detectLegacyConflict();
     const next = mediaIdentity();
     if (next !== currentMediaId) resetMediaState('页面切换', next);
+    else if (conflictChanged) renderHud(false);
   }
   // SPA 路由监听只有顶层需要：iframe 不画 HUD，也不展示媒体态，
   // 每个 iframe 再起一个 500ms 轮询纯属浪费。
@@ -587,6 +613,7 @@
 
   function renderHud(expand) {
     if (!IS_TOP) return;   // 见 IS_TOP 定义处：iframe 里不画 HUD
+    detectLegacyConflict();
     if (!hudOn) return;
     if (!document.body) {
       document.addEventListener('DOMContentLoaded', () => renderHud(expand), { once: true });
@@ -602,9 +629,13 @@
       (cdnState.stalls ? ` · <span style="color:#f66">卡顿 ${cdnState.stalls}</span>` : ' · 卡顿 0');
     const [status, statusColor] = efficiencyText();
     const codecLine = `<span style="color:${statusColor}">${status}</span> · ${codecLabel(codecState.picked)}`;
+    const conflictLine = legacyConflict.detected
+      ? '<span style="color:#ff6b6b;font-weight:bold">⚠️ 旧版 bili-cdn-fix 仍在运行，请到脚本管理器停用</span>'
+      : '';
+    const conflictPrefix = conflictLine ? conflictLine + '<br>' : '';
 
     if (!hudExpanded) {
-      box.innerHTML = cdnLine + '<br>' + codecLine;
+      box.innerHTML = conflictPrefix + cdnLine + '<br>' + codecLine;
       return;
     }
 
@@ -621,7 +652,11 @@
       }
     }
     const offered = codecState.offered.length ? codecState.offered.join(' / ') : '—';
-    box.innerHTML = `<span style="color:#888">CDN 测速${cdnState.lastResults ? '(' + cdnState.lastResults.why + ') · 精测为准' : ''}</span><br>${probeRows}` +
+    const conflictDetails = legacyConflict.detected
+      ? `${conflictLine}<br><span style="color:#ec9">可能位置：Userscripts / AdGuard → Extensions / Tampermonkey</span>` +
+        `<hr style="border:0;border-top:1px solid #444;margin:5px 0">`
+      : '';
+    box.innerHTML = conflictDetails + `<span style="color:#888">CDN 测速${cdnState.lastResults ? '(' + cdnState.lastResults.why + ') · 精测为准' : ''}</span><br>${probeRows}` +
       `<hr style="border:0;border-top:1px solid #444;margin:5px 0"><span style="color:#888">编码信息</span><br>` +
       `${codecLine}<br>编码：${codecLabel(codecState.picked)}<br>powerEfficient：${codecState.efficient == null ? '未知' : codecState.efficient}<br>` +
       `已剔除 AV1：${codecState.stripped} 条<br>B站提供：${offered}` +
@@ -639,7 +674,7 @@
   }
 
   // ---- 调试接口：原 __biliCdn 八项保持不变，在其上增加编码字段 ----
-  const debugApi = {
+  debugApi = {
     get 当前源() { return (cdnState.curKey && cdnState.picked.get(cdnState.curKey)) || cdnState.lastWinner; },
     get 实测速度() { return medianKbps() + ' KB/s（最近 ' + cdnState.perf.length + ' 个分片中位数）'; },
     get 分片明细() { return cdnState.perf.slice(); },
@@ -661,11 +696,20 @@
     get 已剔除AV1() { return codecState.stripped; },
     get B站提供编码() { return codecState.offered.slice(); },
     get 编码偏好() { return prefer; },
+    get 冲突() {
+      return legacyConflict.detected ? {
+        旧脚本: 'bili-cdn-fix',
+        信号: [...legacyConflict.signals],
+        处理: '请在 Userscripts / AdGuard → Extensions / Tampermonkey 中停用旧脚本',
+      } : null;
+    },
   };
+  // 必须在写入兼容别名前检查一次，才能捕获“旧版先注入”的顺序。
+  detectLegacyConflict();
   window.__biliBoost = debugApi;
   window.__biliCdn = debugApi;
 
-  console.log('[bili-boost] ' + SCRIPT_VERSION + ' 已注入，控制台可用 __biliBoost / __biliCdn 查看状态');
+  console.log('[bili-boost] ' + SCRIPT_VERSION + ' 已注入，控制台优先用 __biliBoost 查看状态（__biliCdn 为兼容别名）');
   renderHud(false);
   scheduleMediaWarning();
 })();
