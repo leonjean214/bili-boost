@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         哔哩哔哩播放优化（CDN 测速切源 + 强制硬解编码）
-// @namespace    https://github.com/leonjean214/userscripts
+// @namespace    https://github.com/leonjean214/bili-boost
 // @version      1.0.0
 // @description  CDN 两阶段测速切源，并剔除 AV1、优先 HEVC/H.264，降低海外播放卡顿与软解发热。
 // @author       leonjean214
@@ -8,8 +8,8 @@
 // @run-at       document-start
 // @grant        none
 // @inject-into  page
-// @downloadURL  https://raw.githubusercontent.com/leonjean214/bili-cdn-switcher/main/bili-boost.user.js
-// @updateURL    https://raw.githubusercontent.com/leonjean214/bili-cdn-switcher/main/bili-boost.user.js
+// @downloadURL  https://raw.githubusercontent.com/leonjean214/bili-boost/main/bili-boost.user.js
+// @updateURL    https://raw.githubusercontent.com/leonjean214/bili-boost/main/bili-boost.user.js
 // ==/UserScript==
 
 (function () {

@@ -4,7 +4,11 @@
 
 它们的根因完全不同，但都不是你的网或你的机器不行 —— 是 B 站给你的**镜像不够快**，和 B 站给你的**编码你的芯片解不动**。这个油猴脚本一起治。
 
-> 本脚本由 `bili-cdn-switcher` 与 `bili-hwdecode` 合并而来，已替代这两个单功能脚本。如果你装过它们，**请先在脚本管理器里禁用或删除**，否则会重复劫持请求。
+**[👉 点此安装](https://raw.githubusercontent.com/leonjean214/bili-boost/main/bili-boost.user.js)**（需先装 Tampermonkey 等脚本管理器，见下方[安装](#安装)）
+
+> 本脚本由 `bili-cdn-fix`（CDN 测速切源）与 `bili-hwdecode`（强制硬解编码）两个单功能脚本合并而来，已替代它们。如果你装过其中任何一个，**请先在脚本管理器里禁用或删除**，否则会重复劫持请求、重复测速、出现多个 HUD。
+>
+> 仓库原名 `bili-cdn-switcher`，合并后改名为 `bili-boost`。GitHub 会自动重定向旧链接。
 
 ---
 
