@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         哔哩哔哩播放优化（CDN 测速切源 + 强制硬解编码）
 // @namespace    https://github.com/leonjean214/bili-boost
-// @version      1.0.4
+// @version      1.3.0
 // @description  CDN 两阶段测速切源，并剔除 AV1、优先 HEVC/H.264，降低海外播放卡顿与软解发热。
 // @author       leonjean214
 // @match        *://*.bilibili.com/*
@@ -32,10 +32,130 @@
   const FULL_BYTES = 786432;
   const FINALISTS = 3;
   const PROBE_TIMEOUT = 8000;
+  const DECODING_INFO_TIMEOUT = 3000;
+  // 没有可靠的 Wi-Fi/VPN 变更信号；缓存过长会让同一视频在换网后粘住旧源。
   const CACHE_TTL = 30 * 60e3;
   const MIN_GAIN = 1.25;
   const RETEST_COOLDOWN = 45e3;
   const PERF_WINDOW = 6;
+
+  // ---- 主机健康档案：跨会话统计成功率。稳定性优先于峰值速度——
+  // 一台“70% 时候飞快、30% 超时”的主机，体验差于一台始终中等的主机。 ----
+  const HEALTH_KEY = 'bhw_health';
+  const HEALTH_MIN_ATTEMPTS = 3;     // 样本不足先按最佳档探索；每轮快筛都会让它很快脱离该档
+  const HEALTH_RATIO_DELTA = 0.15;   // 成功率分档宽度；同一档内再比本轮速度
+  const HEALTH_MAX_AGE = 7 * 24 * 3600e3;
+  const HEALTH_MAX_HOSTS = 32;
+  const HEALTH_MAX_ATTEMPTS = 24;    // 到上限后衰减旧样本，避免陈年成功率支配当前网络
+  const HEALTH_SPEED_ALPHA = 0.4;    // 速度走指数滑动平均，新样本权重
+  const IDLE_BUFFER_SEC = 12;
+  const IDLE_MAX_WAIT = 8000;
+
+  function normalizeHealth(raw, now = Date.now()) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return Object.create(null);
+    const entries = [];
+    for (const [host, value] of Object.entries(raw)) {
+      if (!host || host.length > 253 || !value || typeof value !== 'object') continue;
+      const oldAttempts = Math.floor(value.attempts);
+      const oldSuccesses = Math.floor(value.successes);
+      const at = Number(value.at);
+      if (!Number.isFinite(oldAttempts) || oldAttempts < 1 ||
+          !Number.isFinite(oldSuccesses) || oldSuccesses < 0 ||
+          !Number.isFinite(at) || now - at >= HEALTH_MAX_AGE) continue;
+      const attempts = Math.min(oldAttempts, HEALTH_MAX_ATTEMPTS);
+      const successes = Math.min(attempts,
+        Math.round(Math.min(oldSuccesses, oldAttempts) / oldAttempts * attempts));
+      const kbps = Math.round(value.kbps);
+      entries.push([host, {
+        attempts,
+        successes,
+        kbps: Number.isFinite(kbps) && kbps > 0 ? kbps : 0,
+        at: Math.min(at, now),
+      }]);
+    }
+    entries.sort((a, b) => b[1].at - a[1].at || a[0].localeCompare(b[0]));
+    const out = Object.create(null);
+    entries.slice(0, HEALTH_MAX_HOSTS).forEach(([host, value]) => { out[host] = value; });
+    return out;
+  }
+
+  function loadHealth() {
+    try { return normalizeHealth(JSON.parse(localStorage.getItem(HEALTH_KEY) || '{}')); }
+    catch (e) { return Object.create(null); }
+  }
+  let health = loadHealth();
+  let healthDirty = false;
+  function saveHealth(force = false) {
+    if (!force && !healthDirty) return;
+    health = normalizeHealth(health);
+    try {
+      localStorage.setItem(HEALTH_KEY, JSON.stringify(health));
+      healthDirty = false;
+    } catch (e) { }
+  }
+  function probeSucceeded(result) {
+    // 超时只拿到一截数据仍可展示速度，但对“稳定可用”应记作失败。
+    return !!result && result.kbps > 0 && !result.note;
+  }
+  function recordProbe(result) {
+    if (!result || !result.host) return;
+    const r = health[result.host] || (health[result.host] = { attempts: 0, successes: 0, kbps: 0, at: 0 });
+    if (r.attempts >= HEALTH_MAX_ATTEMPTS) {
+      const kept = Math.floor(HEALTH_MAX_ATTEMPTS / 2);
+      r.successes = Math.round(r.successes / r.attempts * kept);
+      r.attempts = kept;
+    }
+    r.attempts++;
+    if (probeSucceeded(result)) {
+      r.successes++;
+      r.kbps = r.kbps
+        ? Math.round(r.kbps * (1 - HEALTH_SPEED_ALPHA) + result.kbps * HEALTH_SPEED_ALPHA)
+        : result.kbps;
+    }
+    r.at = Date.now();
+    healthDirty = true;
+  }
+  function ratioOf(host) {
+    const r = health[host];
+    if (!r || r.attempts < HEALTH_MIN_ATTEMPTS) return null;
+    return r.successes / r.attempts;
+  }
+  function healthTier(host) {
+    const ratio = ratioOf(host);
+    if (ratio === null) return 0;     // 乐观探索，但最多两个样本后就会得到真实分档
+    return Math.floor(Math.max(0, 1 - ratio - Number.EPSILON) / HEALTH_RATIO_DELTA);
+  }
+  // 严格排序键：本轮成功 > 健康档 > 本轮速度。避免带容差的两两比较产生非传递环。
+  function compareHosts(a, b) {
+    const current = Number(probeSucceeded(b)) - Number(probeSucceeded(a));
+    if (current) return current;
+    const tier = healthTier(a.host) - healthTier(b.host);
+    if (tier) return tier;
+    return b.kbps - a.kbps || a.host.localeCompare(b.host);
+  }
+
+  // 精测合计要下 2MB+，播放中做等于跟正片抢带宽，可能自己造成卡顿。
+  // 等缓冲充足或暂停再测；代次变化或等待期间真卡顿时立即停止等待。
+  function waitForIdle(maxWait, shouldStop) {
+    return new Promise(resolve => {
+      const deadline = Date.now() + maxWait;
+      const check = () => {
+        try { if (shouldStop && shouldStop()) return resolve(); } catch (e) { return resolve(); }
+        const v = document.querySelector('video');
+        if (!v || v.paused) return resolve();
+        try {
+          const b = v.buffered;
+          for (let i = 0; i < b.length; i++) {
+            if (b.start(i) <= v.currentTime + 0.25 && b.end(i) >= v.currentTime &&
+                b.end(i) - v.currentTime >= IDLE_BUFFER_SEC) return resolve();
+          }
+        } catch (e) { return resolve(); }
+        if (Date.now() >= deadline) return resolve();
+        setTimeout(check, 500);
+      };
+      check();
+    });
+  }
 
   const UPOS_HOST = /(^|\.)((upos-[a-z0-9-]+\.bilivideo\.com)|(upos-[a-z0-9-]+\.akamaized\.net))$/;
   const MEDIA_EXT = /\.(m4s|mp4|flv)$/;
@@ -47,7 +167,7 @@
   // 但 B站有同源 iframe（如登录轮询用的 /correspond/），脚本在里面照样会跑，
   // 那里既不是视频页也拦不到分片。HUD 必须只由顶层窗口绘制，
   // 否则 iframe 会画出第二个 HUD，内容是「没拦到分片请求 / 未检测编码」。
-  const SCRIPT_VERSION = 'v1.0.4';   // ⚠️ 改版本时要和文件头的 @version 一起改
+  const SCRIPT_VERSION = 'v1.3.0';   // ⚠️ 改版本时要和文件头的 @version 一起改
 
   const IS_TOP = (() => { try { return window.top === window.self; } catch (e) { return false; } })();
 
@@ -89,6 +209,103 @@
     try { localStorage.setItem('bhw_' + key, JSON.stringify(value)); } catch (e) { }
   };
   let prefer = configGet('prefer', 'hevc');
+  // 编码模块三态：'auto'（默认，按本机有没有 AV1 硬解自动决定）| true 强制开 | false 强制关。
+  // 有 AV1 硬解的机器（RTX 40/50 系、Arc、较新核显）不该剔除 AV1——那等于放弃压缩率更高的编码
+  // 去换 HEVC，费带宽又掉画质；无硬解的机器（M1/M2 Mac）则必须剔除，否则软解发热卡顿。
+  let codecMode = configGet('codec', 'auto');
+  if (codecMode !== true && codecMode !== false) codecMode = 'auto';
+
+  // 本机 AV1 硬解能力缓存：null 未知 / true 有 / false 无。探测一次后写 localStorage 长期复用。
+  const cachedAv1Hw = configGet('av1hw', null);
+  let av1Hw = cachedAv1Hw === true || cachedAv1Hw === false ? cachedAv1Hw : null;
+  let av1ProbePromise = null;
+  let av1ProbeGeneration = 0;
+  let av1ProbePending = false;
+
+  // auto 下“未知”一律按“无硬解”处理：误判成有硬解会让软解机器发热卡顿（后果重），
+  // 误判成无硬解只是多费点带宽（后果轻）。不确定时选后果轻的那边。
+  function codecActive() {
+    if (codecMode === true) return true;
+    if (codecMode === false) return false;
+    return av1Hw !== true;
+  }
+
+  function codecModeLabel() {
+    if (codecMode === true) return '强制开';
+    if (codecMode === false) return '强制关（仅 CDN 加速）';
+    const d = av1Hw === true ? '本机有 AV1 硬解 → 不干预'
+            : av1Hw === false ? '本机无 AV1 硬解 → 剔除 AV1'
+            : av1ProbePending ? '探测中 → 暂按剔除 AV1'
+            : '未知 → 暂按剔除 AV1';
+    return '自动｜' + d;
+  }
+
+  // 某些 Chromium 环境的 decodingInfo promise 会永久 pending；超时后只放弃等待，
+  // 原 promise 即使稍后 resolve/reject 也不会再写回状态。
+  function withTimeout(promise, timeout) {
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        reject(new Error('timeout'));
+      }, timeout);
+      Promise.resolve(promise).then(value => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(value);
+      }, error => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(error);
+      });
+    });
+  }
+
+  // 只在没有缓存时跑一次。探测失败保持 null（下次再探），绝不按机型或编码名猜。
+  function probeAv1Hw(force = false) {
+    if (!force && av1Hw !== null) return Promise.resolve(av1Hw);
+    if (!force && av1ProbePromise) return av1ProbePromise;
+
+    const generation = ++av1ProbeGeneration;
+    if (force) {
+      av1Hw = null;
+      configSet('av1hw', null);
+    }
+    av1ProbePending = true;
+    renderHud(false);
+    const task = (async () => {
+      let ok = null;
+      try {
+        const info = await withTimeout(navigator.mediaCapabilities.decodingInfo({
+          type: 'media-source',
+          video: {
+            contentType: 'video/mp4; codecs="av01.0.08M.08"',
+            width: 1920, height: 1080, bitrate: 4000000, framerate: 30,
+          },
+        }), DECODING_INFO_TIMEOUT);
+        if (info && info.supported === false) ok = false;
+        else if (info && info.supported === true && typeof info.powerEfficient === 'boolean') ok = info.powerEfficient;
+      } catch (e) { ok = null; }
+
+      // 手动重探会使旧探测失效，防止较晚返回的旧结果覆盖新结果。
+      if (generation !== av1ProbeGeneration) return av1Hw;
+      if (ok !== null) {
+        av1Hw = ok;
+        configSet('av1hw', ok);
+      }
+      return av1Hw;
+    })();
+    av1ProbePromise = task.finally(() => {
+      if (generation !== av1ProbeGeneration) return;
+      av1ProbePending = false;
+      av1ProbePromise = null;
+      renderHud(false);
+    });
+    return av1ProbePromise;
+  }
   let hudOn = (() => {
     let cdnOn = true;
     try { cdnOn = localStorage.getItem('biliCdnHud') !== 'off'; } catch (e) { }
@@ -209,7 +426,8 @@
     target.hostname = host;
     const ctl = new AbortController();
     const timer = setTimeout(() => ctl.abort(), PROBE_TIMEOUT);
-    let got = 0, tFirst = 0;
+    let got = 0;
+    const started = performance.now();
     try {
       const res = await origFetch.call(window, target.toString(), { credentials: 'omit', cache: 'no-store', signal: ctl.signal });
       if (!res.ok || !res.body) {
@@ -220,17 +438,16 @@
       while (got < bytes) {
         const { done, value } = await reader.read();
         if (done) break;
-        if (!tFirst) tFirst = performance.now();
         got += value.length;
       }
       reader.cancel().catch(() => { });
-      const dt = (performance.now() - tFirst) / 1000;
-      if (!tFirst || got < 32768 || dt <= 0) return { host, kbps: 0, note: '数据不足' };
+      const dt = (performance.now() - started) / 1000;
+      if (got < 32768 || dt <= 0) return { host, kbps: 0, note: '数据不足' };
       return { host, kbps: Math.round(got / 1024 / dt) };
     } catch (e) {
       if (e.name !== 'AbortError') cdnState.blacklist.add(host);
-      if (tFirst && got >= 32768) {
-        const dt = (performance.now() - tFirst) / 1000;
+      if (got >= 32768) {
+        const dt = (performance.now() - started) / 1000;
         return { host, kbps: Math.round(got / 1024 / dt), note: '超时截断' };
       }
       return { host, kbps: 0, note: e.name === 'AbortError' ? '超时' : '失败' };
@@ -239,7 +456,7 @@
     }
   }
 
-  // ---- CDN：两阶段测速，逻辑保持 v3.0 ----
+  // ---- CDN：两阶段测速 ----
   async function runCdnProbe(url, why) {
     const key = keyOf(url);
     const generation = mediaGeneration;
@@ -255,29 +472,51 @@
       if (!pool.length) return;
 
       const quick = await Promise.all(pool.map(host => probeCdn(url, host, QUICK_BYTES)));
-      quick.forEach(result => { result.stage = '快筛'; });
-      quick.sort((a, b) => b.kbps - a.kbps);
+      quick.forEach(result => { result.stage = '快筛'; recordProbe(result); });
+      quick.sort(compareHosts);
 
-      const finalists = quick.filter(result => result.kbps > 0).slice(0, FINALISTS);
+      const finalists = quick.filter(probeSucceeded).slice(0, FINALISTS);
+      if (!finalists.length) return;
       const full = [];
+      const stallsBeforeWait = cdnState.stalls;
+      if (why !== '卡顿重测') {
+        await waitForIdle(IDLE_MAX_WAIT,
+          () => generation !== mediaGeneration || cdnState.stalls !== stallsBeforeWait);
+      }
+      if (generation !== mediaGeneration) return;
       for (const finalist of finalists) {
+        const latestBad = cdnState.rejected.get(key);
+        if (cdnState.blacklist.has(finalist.host) || (latestBad && latestBad.has(finalist.host))) continue;
         const result = await probeCdn(url, finalist.host, FULL_BYTES);
         result.stage = '精测';
+        recordProbe(result);
         full.push(result);
+        if (generation !== mediaGeneration) return;
       }
-      full.sort((a, b) => b.kbps - a.kbps);
+      full.sort(compareHosts);
 
       const merged = full.concat(quick.filter(q => !full.some(f => f.host === q.host)));
-      const best = full[0];
+      // 测速期间也可能因真实播放卡顿把临时源加入拒绝名单；最终选择必须读取最新集合。
+      const latestBad = cdnState.rejected.get(key);
+      const eligible = full.filter(result => probeSucceeded(result) &&
+        !cdnState.blacklist.has(result.host) && !(latestBad && latestBad.has(result.host)));
+      const best = eligible[0];
       if (!best || generation !== mediaGeneration) return;
-      const orig = full.find(result => result.host === origHost);
-      const win = orig && best.kbps <= orig.kbps * MIN_GAIN ? origHost : best.host;
+      const orig = eligible.find(result => result.host === origHost);
+      // 原始源保护只在同一健康档内生效，否则会反过来覆盖“稳定性优先”。
+      const keepOrig = orig && healthTier(orig.host) === healthTier(best.host) &&
+        best.kbps <= orig.kbps * MIN_GAIN;
+      const win = keepOrig ? origHost : best.host;
 
       cdnState.picked.set(key, win);
       saveCdnCache(key, win);
       if (win !== origHost) {
         cdnState.lastWinner = win;
         saveGlobalWinner(win);
+      } else if (cdnState.lastWinner) {
+        // 本轮已证明原始源更合适，不能让旧的全局赢家继续污染后续视频的临时选源。
+        cdnState.lastWinner = null;
+        try { localStorage.removeItem('biliCdnWinner'); } catch (e) { }
       }
       cdnState.lastResults = { list: merged, win, origHost, why, ts: Date.now() };
       cdnState.perf.length = 0;
@@ -286,6 +525,8 @@
         '→ 选用', win);
       renderHud(true);
     } finally {
+      // 一轮快筛 + 精测只落盘一次，避免每个候选都同步写 localStorage。
+      saveHealth();
       cdnState.probing.delete(probeKey);
     }
   }
@@ -306,18 +547,30 @@
     let target = cdnState.picked.get(key) || loadCdnCache(key);
     if (target) cdnState.picked.set(key, target);
 
+    const bad = cdnState.rejected.get(key);
+    if (target && (cdnState.blacklist.has(target) || (bad && bad.has(target)))) {
+      target = null;
+      cdnState.picked.delete(key);
+      try { sessionStorage.removeItem('biliCdn:' + key); } catch (e) { }
+    }
     if (!target) {
       runCdnProbe(url, '开播');
       target = cdnState.lastWinner;
+      if (target && !cdnState.blacklist.has(target) && !(bad && bad.has(target))) {
+        // 记录测速完成前使用的会话赢家，让真实卡顿可以立即淘汰它。
+        cdnState.picked.set(key, target);
+      } else {
+        target = null;
+      }
     }
-    const bad = cdnState.rejected.get(key);
-    if (!target || target === url.hostname || cdnState.blacklist.has(target) || (bad && bad.has(target))) return raw;
+    if (!target || target === url.hostname) return raw;
     url.hostname = target;
     return url.toString();
   }
 
   // ---- 编码模块：播放数据改写，与 CDN 状态完全无关 ----
   function rewritePlayinfo(payload) {
+    if (!codecActive()) return payload;
     if (!isVideoPage()) return payload;
     syncMediaIdentity();
     try {
@@ -362,6 +615,7 @@
 
   const PREFER_TYPE = { hevc: '1', avc: '2' };
   function patchCodecStrategy() {
+    if (!codecActive()) return;
     try { localStorage.setItem('bilibili_player_codec_prefer_type', PREFER_TYPE[prefer] || '1'); } catch (e) { }
     try {
       const key = 'bilibili_player_kv_config';
@@ -394,31 +648,42 @@
   }
 
   // ---- 统一劫持层：open / send / fetch 各安装一次 ----
+  const XHR_PLAYURL = Symbol('biliBoostPlayurl');
+  const XHR_CDN = Symbol('biliBoostCdn');
+  const XHR_RESPONSE_HOOKED = Symbol('biliBoostResponseHooked');
   XMLHttpRequest.prototype.open = function (method, rawUrl, ...rest) {
-    const playurl = isVideoPage() && isPlayurl(rawUrl);
-    const out = typeof rawUrl === 'string' ? rewriteSegmentUrl(rawUrl) : rawUrl;
-    this.__biliBoostPlayurl = playurl;
+    // XMLHttpRequest 可以复用；清掉上一次 playurl 请求装在实例上的 getter 和状态。
+    if (this[XHR_RESPONSE_HOOKED]) {
+      try { delete this.responseText; } catch (e) { }
+      try { delete this.response; } catch (e) { }
+      this[XHR_RESPONSE_HOOKED] = false;
+    }
+    const playurl = codecActive() && isVideoPage() && isPlayurl(rawUrl);
+    const out = typeof rawUrl === 'string' || rawUrl instanceof URL ? rewriteSegmentUrl(rawUrl) : rawUrl;
+    this[XHR_PLAYURL] = playurl;
+    this[XHR_CDN] = null;
     try {
       const url = new URL(out, location.href);
-      if (isMedia(url)) this.__biliBoostCdn = { host: url.hostname, url };
+      if (isMedia(url)) this[XHR_CDN] = { host: url.hostname, url };
     } catch (e) { }
     return origOpen.call(this, method, out, ...rest);
   };
 
   XMLHttpRequest.prototype.send = function (...args) {
-    if (this.__biliBoostCdn) {
+    const cdnRequest = this[XHR_CDN];
+    if (cdnRequest) {
       const started = performance.now();
       this.addEventListener('loadend', event => {
         const seconds = (performance.now() - started) / 1000;
         if (event.loaded > 65536 && seconds > 0.05) {
-          cdnState.perf.push({ host: this.__biliBoostCdn.host, kbps: Math.round(event.loaded / 1024 / seconds) });
+          cdnState.perf.push({ host: cdnRequest.host, kbps: Math.round(event.loaded / 1024 / seconds) });
           if (cdnState.perf.length > PERF_WINDOW) cdnState.perf.shift();
           renderHud(false);
         }
-      });
+      }, { once: true });
     }
 
-    if (this.__biliBoostPlayurl) {
+    if (this[XHR_PLAYURL]) {
       const self = this;
       let rawText, outText, hasText = false, rawObject, outObject;
       const fromText = raw => {
@@ -437,6 +702,7 @@
           configurable: true,
           get() { return fromText(protoGetter('responseText').call(self)); },
         });
+        this[XHR_RESPONSE_HOOKED] = true;
       } catch (e) { console.warn('[硬解] responseText 劫持失败，已放行：', e); }
       try {
         Object.defineProperty(this, 'response', {
@@ -451,21 +717,22 @@
             return outObject;
           },
         });
+        this[XHR_RESPONSE_HOOKED] = true;
       } catch (e) { console.warn('[硬解] response 劫持失败，已放行：', e); }
     }
     return origSend.apply(this, args);
   };
 
   window.fetch = async function (input, init) {
-    const originalUrl = typeof input === 'string' ? input : (input && input.url) || '';
-    if (typeof input === 'string') {
+    const originalUrl = typeof input === 'string' || input instanceof URL ? String(input) : (input && input.url) || '';
+    if (typeof input === 'string' || input instanceof URL) {
       input = rewriteSegmentUrl(input);
     } else if (input instanceof Request) {
       const rewritten = rewriteSegmentUrl(input.url);
       if (rewritten !== input.url) input = new Request(rewritten, input);
     }
     const response = await origFetch.call(this, input, init);
-    if (!isVideoPage() || !isPlayurl(originalUrl)) return response;
+    if (!codecActive() || !isVideoPage() || !isPlayurl(originalUrl)) return response;
     try {
       const body = JSON.stringify(rewritePlayinfo(await response.clone().json()));
       const headers = new Headers(response.headers);
@@ -521,7 +788,7 @@
 
     let efficient = null;
     try {
-      const info = await navigator.mediaCapabilities.decodingInfo({
+      const info = await withTimeout(navigator.mediaCapabilities.decodingInfo({
         type: 'media-source',
         video: {
           contentType: picked,
@@ -530,7 +797,7 @@
           bitrate: 4000000,
           framerate: 30,
         },
-      });
+      }), DECODING_INFO_TIMEOUT);
       efficient = info.powerEfficient;
     } catch (e) { /* 查询失败必须保持“未知”，不能按编码名猜 */ }
     if (generation !== mediaGeneration || picked !== codecState.picked) return;
@@ -591,6 +858,13 @@
       'box-shadow:0 3px 14px rgba(0,0,0,.5);white-space:pre;transition:opacity .4s;cursor:pointer;user-select:none';
     box.addEventListener('click', event => {
       const action = event.target.closest('[data-action]')?.dataset.action;
+      if (action === 'codec') {
+        event.stopPropagation();
+        codecMode = codecMode === 'auto' ? true : codecMode === true ? false : 'auto';
+        configSet('codec', codecMode);
+        location.reload();
+        return;
+      }
       if (action === 'prefer') {
         event.stopPropagation();
         prefer = prefer === 'avc' ? 'hevc' : 'avc';
@@ -661,7 +935,8 @@
       `${codecLine}<br>编码：${codecLabel(codecState.picked)}<br>powerEfficient：${codecState.efficient == null ? '未知' : codecState.efficient}<br>` +
       `已剔除 AV1：${codecState.stripped} 条<br>B站提供：${offered}` +
       `<hr style="border:0;border-top:1px solid #444;margin:5px 0">` +
-      `<span data-action="prefer" style="color:#8cf">编码偏好：${prefer === 'avc' ? 'H.264' : 'H.265'}（点击切换）</span><br>` +
+      `<span data-action="codec" style="color:#8cf">编码模块：${codecModeLabel()}（点击轮换）</span><br>` +
+      (codecActive() ? `<span data-action="prefer" style="color:#8cf">编码偏好：${prefer === 'avc' ? 'H.264' : 'H.265'}（点击切换）</span><br>` : '') +
       `<span data-action="hud" style="color:#8cf">HUD：开（点击关闭）</span>` +
       `<hr style="border:0;border-top:1px solid #444;margin:5px 0">${cdnLine}`;
     if (expand) {
@@ -695,7 +970,34 @@
     get 硬解状态() { return codecState.efficient === true ? '硬解' : codecState.efficient === false ? '软解' : '未知'; },
     get 已剔除AV1() { return codecState.stripped; },
     get B站提供编码() { return codecState.offered.slice(); },
+    get 主机健康() {
+      const out = {};
+      for (const host in health) {
+        const r = health[host];
+        out[shortName(host)] = `${r.successes}/${r.attempts} 成功` +
+          (r.attempts >= HEALTH_MIN_ATTEMPTS ? ` (${Math.round(r.successes / r.attempts * 100)}%)` : ' (样本不足)') +
+          (r.kbps ? ` · 滑动均速 ${r.kbps}KB/s` : '');
+      }
+      return out;
+    },
+    清空主机健康() {
+      health = Object.create(null);
+      healthDirty = true;
+      saveHealth();
+      return '已清空，下次测速重新积累';
+    },
     get 编码偏好() { return prefer; },
+    get 编码模块() { return codecModeLabel(); },
+    get AV1硬解() { return av1Hw === null ? '未探测' : av1Hw ? '有' : '无'; },
+    // 传 'auto' / true / false
+    编码模块开关(v) {
+      codecMode = (v === true || v === false) ? v : 'auto';
+      configSet('codec', codecMode);
+      return codecModeLabel() + '，刷新生效';
+    },
+    重新探测AV1() {
+      return probeAv1Hw(true).then(r => r === null ? '探测失败，保持未知' : (r ? '本机有 AV1 硬解' : '本机无 AV1 硬解'));
+    },
     get 冲突() {
       return legacyConflict.detected ? {
         旧脚本: 'bili-cdn-fix',
@@ -711,5 +1013,8 @@
 
   console.log('[bili-boost] ' + SCRIPT_VERSION + ' 已注入，控制台优先用 __biliBoost 查看状态（__biliCdn 为兼容别名）');
   renderHud(false);
+  // 首次播放先按保守策略（剔除 AV1）跑，探测结果落盘后从下一次加载起生效。
+  // 只在视频页自动探测，避免首页和无关 iframe 同时发起能力查询。
+  if (codecMode === 'auto' && isVideoPage()) probeAv1Hw().then(() => renderHud(false));
   scheduleMediaWarning();
 })();
