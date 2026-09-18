@@ -475,28 +475,186 @@ async function main() {
     });
   });
 
+  await runScenario('编码三态向后兼容', async cdp => {
+    await navigate(cdp, 'https://www.bilibili.com/robots.txt');
+    const readModeAfterReload = async (stored, suffix, clearHw = false) => {
+      await cdp.eval(`localStorage.setItem('bhw_codec', ${JSON.stringify(JSON.stringify(stored))});` +
+        (clearHw ? "localStorage.setItem('bhw_av1hw', 'null');" : ''));
+      await navigate(cdp, `https://www.bilibili.com/robots.txt?qa_codec=${suffix}`);
+      return waitFor(() => cdp.eval(String.raw`(() => window.__biliBoost ? ({
+        mode: window.__biliBoost.编码模块,
+        av1: window.__biliBoost.AV1硬解
+      }) : null)()`), { timeout: 3_000, label: `codec mode ${suffix}` });
+    };
+    const forcedOn = await readModeAfterReload(true, 'true');
+    const forcedOff = await readModeAfterReload(false, 'false');
+    const automatic = await readModeAfterReload('auto', 'auto', true);
+    const pass = /^强制开/.test(forcedOn.mode) && /^强制关/.test(forcedOff.mode) &&
+      /自动｜未知 → 暂按剔除 AV1/.test(automatic.mode) && automatic.av1 === '未探测';
+    addResult('编码三态向后兼容', pass ? 'PASS' : 'FAIL', {
+      reason: pass ? '旧 bhw_codec=true/false 语义不变；auto+null 仍保守剔除 AV1' :
+        JSON.stringify({ forcedOn, forcedOff, automatic }),
+    });
+  });
+
+  await runScenario('AV1 硬解缓存过期', async cdp => {
+    await navigate(cdp, 'https://www.bilibili.com/robots.txt');
+    const staleAt = Date.now() - 31 * 24 * 3600_000;
+    await cdp.eval(String.raw`(() => {
+      const env = [navigator.userAgent || '', navigator.platform || '', navigator.hardwareConcurrency || ''].join('|');
+      localStorage.setItem('bhw_codec', JSON.stringify('auto'));
+      localStorage.setItem('bhw_av1hw', JSON.stringify({ value: true, at: ${staleAt}, env }));
+    })()`);
+    await navigate(cdp, ugcUrl);
+    const codec = await waitForCodec(cdp);
+    const refreshed = await waitFor(() => cdp.eval(String.raw`(() => {
+      try {
+        const value = JSON.parse(localStorage.getItem('bhw_av1hw'));
+        return value && typeof value === 'object' && typeof value.value === 'boolean' && value.at > ${staleAt}
+          ? value : null;
+      } catch { return null; }
+    })()`), { timeout: 8_000, interval: 100, label: 'refreshed AV1 hardware cache metadata' });
+    const pass = ['HEVC', 'AVC'].includes(codecKind(codec)) && refreshed.at > staleAt;
+    addResult('AV1 硬解缓存过期', pass ? 'PASS' : 'FAIL', {
+      codec,
+      reason: pass ? '31 天旧结论未被信任，首屏保守剔除 AV1，并写回带环境/时间的新结论' : JSON.stringify(refreshed),
+    });
+  });
+
   await testSimple('普通 UGC 视频页', ugcUrl, ['HEVC', 'AVC']);
 
   await runScenario('CDN 模块', async cdp => {
     await navigate(cdp, ugcUrl);
     const result = await waitFor(() => cdp.eval(String.raw`(() => {
       const api = window.__biliCdn;
-      const names = ['当前源', '实测速度', '分片明细', '测速结果', '卡顿次数', '黑名单', '重测', '面板'];
+      const names = ['当前源', '实测速度', '首字节延迟', '分片明细', '测速结果', '卡顿次数',
+        '黑名单', '重测', '手动选源', '自动选源', '面板'];
       if (!api?.测速结果) return null;
+      const list = api.测速结果.list || [];
+      const precise = list.find(item => item.ok === true && Array.isArray(item.points) && item.points.length > 1);
+      const choice = list.find(item => item.ok === true);
+      const source = api.当前源;
+      let manualOk = false;
+      if (choice) {
+        api.手动选源(choice.host);
+        manualOk = api.手动源 === choice.host && api.当前源 === choice.host;
+        api.自动选源();
+      }
       return {
         alias: api === window.__biliBoost,
         publicApi: names.every(name => name in api),
-        resultCount: api.测速结果?.list?.length || 0,
+        resultCount: list.length,
         stallsType: typeof api.卡顿次数,
-        source: api.当前源,
-        speed: api.实测速度
+        source,
+        speed: api.实测速度,
+        timingOk: !!precise && Number.isFinite(precise.ttfb) &&
+          precise.points.some(point => point.point === '中'),
+        manualOk
       };
-    })()`), { timeout: 55_000, interval: 500, label: 'CDN 两阶段测速结果' });
-    const pass = result.alias && result.publicApi && result.resultCount > 0 && result.stallsType === 'number';
+    })()`), { timeout: 55_000, interval: 500, label: 'CDN 两阶段多点测速结果' });
+    const pass = result.alias && result.publicApi && result.resultCount > 0 &&
+      result.stallsType === 'number' && result.timingOk && result.manualOk;
     addResult('CDN 模块', pass ? 'PASS' : 'FAIL', {
       codec: result.source || '未选源',
-      reason: `${pass ? '' : 'CDN 公开接口或测速状态不完整；'}测速条目=${result.resultCount}，实测=${result.speed}`,
+      reason: `${pass ? '' : 'CDN 公开接口、多点计时或手动切源不完整；'}测速条目=${result.resultCount}，实测=${result.speed}`,
     });
+  });
+
+  await runScenario('fetch 实测速与卡顿过滤', async cdp => {
+    await navigate(cdp, 'https://www.bilibili.com/robots.txt');
+    const host = 'upos-sz-mirrorcosov.bilivideo.com';
+    await cdp.eval(String.raw`(() => {
+      sessionStorage.setItem('biliCdn:/qa', JSON.stringify({
+        host: ${JSON.stringify('upos-sz-mirrorcosov.bilivideo.com')}, ts: Date.now()
+      }));
+    })()`);
+    const payload = Buffer.alloc(96 * 1024, 0xab);
+    let interceptionError;
+    const off = cdp.on('Fetch.requestPaused', async event => {
+      try {
+        await sleep(180);
+        await cdp.send('Fetch.fulfillRequest', {
+          requestId: event.requestId,
+          responseCode: 200,
+          responseHeaders: [
+            { name: 'Content-Type', value: 'video/mp4' },
+            { name: 'Content-Length', value: String(payload.length) },
+            { name: 'Access-Control-Allow-Origin', value: '*' },
+          ],
+          body: payload.toString('base64'),
+        });
+      } catch (error) {
+        interceptionError = error;
+      }
+    });
+    try {
+      await cdp.send('Fetch.enable', { patterns: [{ urlPattern: '*qa-fetch-segment.m4s*' }] });
+      const request = await cdp.eval(String.raw`(async () => {
+        const response = await fetch('https://${host}/qa/qa-fetch-segment.m4s');
+        return {
+          bytes: (await response.arrayBuffer()).byteLength,
+          url: response.url,
+          status: response.status,
+          redirected: response.redirected,
+          type: response.type
+        };
+      })()`, true);
+      if (interceptionError) throw interceptionError;
+      const sample = await waitFor(() => cdp.eval(String.raw`(() =>
+        window.__biliBoost?.分片明细.find(item => item.via === 'fetch') || null
+      )()`), { timeout: 5_000, interval: 100, label: 'fetch segment telemetry' });
+      const stallAudit = await cdp.eval(String.raw`(async () => {
+        const api = window.__biliBoost;
+        const state = { time: 0, seeking: false };
+        const video = document.createElement('video');
+        Object.defineProperties(video, {
+          paused: { configurable: true, get: () => false },
+          ended: { configurable: true, get: () => false },
+          seeking: { configurable: true, get: () => state.seeking },
+          readyState: { configurable: true, get: () => 2 },
+          currentTime: { configurable: true, get: () => state.time, set: value => { state.time = value; } },
+        });
+        document.body.appendChild(video);
+        const emit = type => video.dispatchEvent(new Event(type));
+
+        emit('waiting');
+        await new Promise(resolve => setTimeout(resolve, 1400));
+        const initial = api.卡顿次数;
+
+        state.seeking = true;
+        emit('seeking');
+        state.seeking = false;
+        emit('seeked');
+        state.time = 0.2;
+        emit('timeupdate');
+        emit('waiting');
+        await new Promise(resolve => setTimeout(resolve, 1400));
+        const seeking = api.卡顿次数;
+
+        await new Promise(resolve => setTimeout(resolve, 1300));
+        state.time = 0.4;
+        emit('timeupdate');
+        emit('waiting');
+        setTimeout(() => emit('playing'), 200);
+        await new Promise(resolve => setTimeout(resolve, 1400));
+        const recovered = api.卡顿次数;
+        video.remove();
+        return { initial, seeking, recovered };
+      })()`, true);
+      const stallFilterOk = Object.values(stallAudit).every(value => value === 0);
+      const pass = request.bytes === payload.length && request.status === 200 &&
+        request.url.includes('/qa/qa-fetch-segment.m4s') && request.redirected === false &&
+        sample.host === host && sample.bytes === payload.length && sample.kbps > 0 && sample.ttfb >= 100 &&
+        stallFilterOk;
+      addResult('fetch 实测速与卡顿过滤', pass ? 'PASS' : 'FAIL', {
+        codec: `${sample.kbps}KB/s · ${sample.ttfb}ms`,
+        reason: pass ? '原 Response 语义不变；fetch 吞吐/TTFB 已记录；初始、seek、瞬时 waiting 均未误判' :
+          JSON.stringify({ request, sample, stallAudit }),
+      });
+    } finally {
+      off();
+      try { await cdp.send('Fetch.disable'); } catch {}
+    }
   });
 
   await runScenario('防重复注入', async cdp => {

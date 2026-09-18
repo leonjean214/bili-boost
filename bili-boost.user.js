@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         哔哩哔哩播放优化（CDN 测速切源 + 强制硬解编码）
 // @namespace    https://github.com/leonjean214/bili-boost
-// @version      1.3.0
-// @description  CDN 两阶段测速切源，并剔除 AV1、优先 HEVC/H.264，降低海外播放卡顿与软解发热。
+// @version      1.4.0
+// @description  CDN 两阶段多点测速切源，并剔除 AV1、优先 HEVC/H.264，降低海外播放卡顿与软解发热。
 // @author       leonjean214
 // @match        *://*.bilibili.com/*
 // @run-at       document-start
@@ -19,20 +19,26 @@
   if (window.__biliBoostInstalled) return;
   window.__biliBoostInstalled = true;
 
-  // ---- CDN 配置：数值、候选顺序与 v3.0 完全一致 ----
+  // ---- CDN 配置 ----
   const CANDIDATES = [
     'upos-sz-mirror08c.bilivideo.com',
     'upos-sz-mirrorali.bilivideo.com',
     'upos-sz-mirrorcos.bilivideo.com',
     'upos-sz-mirrorhw.bilivideo.com',
     'upos-sz-mirrorcosov.bilivideo.com',
-    'upos-hz-mirrorakam.akamaized.net',
   ];
+  // 不主动把 bilivideo URL 合成为 Akamai：跨供应商签名可能绑定 host，实测常见 403。
+  // 若播放器原地址本来就是 akamaized.net，它仍会作为 origHost 参加测速，但不会跨域族改写。
   const QUICK_BYTES = 131072;
   const FULL_BYTES = 786432;
+  const PRECISION_POINT_BYTES = Math.floor(FULL_BYTES / 2);
+  const MID_RANGE_OFFSET = 1024 * 1024;
   const FINALISTS = 3;
   const PROBE_TIMEOUT = 8000;
   const DECODING_INFO_TIMEOUT = 3000;
+  const AV1_HW_CACHE_TTL = 30 * 24 * 3600e3;
+  const FETCH_MEASURE_TIMEOUT = 30000;
+  const FETCH_MEASURE_MAX_BYTES = 32 * 1024 * 1024;
   // 没有可靠的 Wi-Fi/VPN 变更信号；缓存过长会让同一视频在换网后粘住旧源。
   const CACHE_TTL = 30 * 60e3;
   const MIN_GAIN = 1.25;
@@ -47,9 +53,13 @@
   const HEALTH_MAX_AGE = 7 * 24 * 3600e3;
   const HEALTH_MAX_HOSTS = 32;
   const HEALTH_MAX_ATTEMPTS = 24;    // 到上限后衰减旧样本，避免陈年成功率支配当前网络
-  const HEALTH_SPEED_ALPHA = 0.4;    // 速度走指数滑动平均，新样本权重
+  const HEALTH_SPEED_ALPHA = 0.4;    // 速度/TTFB 走指数滑动平均，新样本权重
   const IDLE_BUFFER_SEC = 12;
   const IDLE_MAX_WAIT = 8000;
+  const STALL_CONFIRM_MS = 1200;
+  const STALL_SEEK_GRACE = 2500;
+  const STALL_LOAD_GRACE = 3000;
+  const STALL_DEDUP_MS = 3000;
 
   function normalizeHealth(raw, now = Date.now()) {
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return Object.create(null);
@@ -66,10 +76,12 @@
       const successes = Math.min(attempts,
         Math.round(Math.min(oldSuccesses, oldAttempts) / oldAttempts * attempts));
       const kbps = Math.round(value.kbps);
+      const ttfb = Math.round(value.ttfb);
       entries.push([host, {
         attempts,
         successes,
         kbps: Number.isFinite(kbps) && kbps > 0 ? kbps : 0,
+        ttfb: Number.isFinite(ttfb) && ttfb >= 0 ? ttfb : 0,
         at: Math.min(at, now),
       }]);
     }
@@ -95,7 +107,8 @@
   }
   function probeSucceeded(result) {
     // 超时只拿到一截数据仍可展示速度，但对“稳定可用”应记作失败。
-    return !!result && result.kbps > 0 && !result.note;
+    // note 只负责展示；Range 不可用等提示可以与成功状态并存。
+    return !!result && result.ok === true && result.kbps > 0;
   }
   function recordProbe(result) {
     if (!result || !result.host) return;
@@ -111,6 +124,11 @@
       r.kbps = r.kbps
         ? Math.round(r.kbps * (1 - HEALTH_SPEED_ALPHA) + result.kbps * HEALTH_SPEED_ALPHA)
         : result.kbps;
+      if (Number.isFinite(result.ttfb) && result.ttfb >= 0) {
+        r.ttfb = r.ttfb
+          ? Math.round(r.ttfb * (1 - HEALTH_SPEED_ALPHA) + result.ttfb * HEALTH_SPEED_ALPHA)
+          : Math.round(result.ttfb);
+      }
     }
     r.at = Date.now();
     healthDirty = true;
@@ -125,13 +143,25 @@
     if (ratio === null) return 0;     // 乐观探索，但最多两个样本后就会得到真实分档
     return Math.floor(Math.max(0, 1 - ratio - Number.EPSILON) / HEALTH_RATIO_DELTA);
   }
-  // 严格排序键：本轮成功 > 健康档 > 本轮速度。避免带容差的两两比较产生非传递环。
+  // 用“首字节 + 传输时间”估算一个标准精测样本的交付耗时，让 TTFB 与净吞吐各自有意义。
+  function deliveryMs(result) {
+    if (Number.isFinite(result?.deliveryMs) && result.deliveryMs >= 0) return result.deliveryMs;
+    if (!result || !Number.isFinite(result.kbps) || result.kbps <= 0) return Infinity;
+    const ttfb = Number.isFinite(result.ttfb) && result.ttfb >= 0 ? result.ttfb : 0;
+    return ttfb + FULL_BYTES / 1024 / result.kbps * 1000;
+  }
+  // 严格排序键：本轮成功 > 健康档 > 估算交付耗时 > TTFB > host。
+  // 每一级都是普通数值/字符串全序，避免带容差的两两比较产生非传递环。
   function compareHosts(a, b) {
     const current = Number(probeSucceeded(b)) - Number(probeSucceeded(a));
     if (current) return current;
     const tier = healthTier(a.host) - healthTier(b.host);
     if (tier) return tier;
-    return b.kbps - a.kbps || a.host.localeCompare(b.host);
+    const delivery = deliveryMs(a) - deliveryMs(b);
+    if (delivery) return delivery;
+    const aTtfb = Number.isFinite(a.ttfb) ? a.ttfb : Infinity;
+    const bTtfb = Number.isFinite(b.ttfb) ? b.ttfb : Infinity;
+    return aTtfb - bTtfb || a.host.localeCompare(b.host);
   }
 
   // 精测合计要下 2MB+，播放中做等于跟正片抢带宽，可能自己造成卡顿。
@@ -167,7 +197,7 @@
   // 但 B站有同源 iframe（如登录轮询用的 /correspond/），脚本在里面照样会跑，
   // 那里既不是视频页也拦不到分片。HUD 必须只由顶层窗口绘制，
   // 否则 iframe 会画出第二个 HUD，内容是「没拦到分片请求 / 未检测编码」。
-  const SCRIPT_VERSION = 'v1.3.0';   // ⚠️ 改版本时要和文件头的 @version 一起改
+  const SCRIPT_VERSION = 'v1.4.0';   // ⚠️ 改版本时要和文件头的 @version 一起改
 
   const IS_TOP = (() => { try { return window.top === window.self; } catch (e) { return false; } })();
 
@@ -186,6 +216,7 @@
     blacklist: new Set(),
     rejected: new Map(),
     picked: new Map(),
+    manual: new Map(),
     probing: new Set(),
     perf: [],
     lastResults: null,
@@ -195,9 +226,19 @@
     sawMedia: false,
     missedWarning: false,
     curKey: null,
+    activeHost: null,
     lastProbeUrl: null,
   };
   const codecState = { stripped: 0, picked: null, offered: [], efficient: null };
+  const playbackState = {
+    video: null,
+    hasAdvanced: false,
+    lastTime: 0,
+    lastAdvanceAt: 0,
+    suppressUntil: performance.now() + STALL_LOAD_GRACE,
+    pending: null,
+    lastConfirmedAt: 0,
+  };
   let mediaGeneration = 0;
   let currentMediaId = mediaIdentity();
 
@@ -215,9 +256,23 @@
   let codecMode = configGet('codec', 'auto');
   if (codecMode !== true && codecMode !== false) codecMode = 'auto';
 
-  // 本机 AV1 硬解能力缓存：null 未知 / true 有 / false 无。探测一次后写 localStorage 长期复用。
-  const cachedAv1Hw = configGet('av1hw', null);
-  let av1Hw = cachedAv1Hw === true || cachedAv1Hw === false ? cachedAv1Hw : null;
+  // 本机 AV1 硬解能力缓存：null 未知 / true 有 / false 无。
+  // 缓存同时绑定浏览器环境并设 30 天 TTL；旧版裸 boolean 会自动失效并重探一次。
+  function av1CacheEnvironment() {
+    return [navigator.userAgent || '', navigator.platform || '', navigator.hardwareConcurrency || ''].join('|');
+  }
+  function loadAv1HwCache() {
+    const cached = configGet('av1hw', null);
+    const at = Number(cached?.at);
+    const valid = cached && typeof cached === 'object' && !Array.isArray(cached) &&
+      (cached.value === true || cached.value === false) && Number.isFinite(at) &&
+      at <= Date.now() && Date.now() - at < AV1_HW_CACHE_TTL && cached.env === av1CacheEnvironment();
+    if (valid) return cached.value;
+    // 旧版裸 boolean、过期值和环境不匹配值都显式清掉；若重探失败，存储和内存都保持 null。
+    if (cached !== null) configSet('av1hw', null);
+    return null;
+  }
+  let av1Hw = loadAv1HwCache();
   let av1ProbePromise = null;
   let av1ProbeGeneration = 0;
   let av1ProbePending = false;
@@ -294,7 +349,7 @@
       if (generation !== av1ProbeGeneration) return av1Hw;
       if (ok !== null) {
         av1Hw = ok;
-        configSet('av1hw', ok);
+        configSet('av1hw', { value: ok, at: Date.now(), env: av1CacheEnvironment() });
       }
       return av1Hw;
     })();
@@ -372,6 +427,7 @@
     currentMediaId = nextId;
     cdnState.rejected.clear();
     cdnState.picked.clear();
+    cdnState.manual.clear();
     cdnState.probing.clear();
     cdnState.perf.length = 0;
     cdnState.lastResults = null;
@@ -380,11 +436,13 @@
     cdnState.sawMedia = false;
     cdnState.missedWarning = false;
     cdnState.curKey = null;
+    cdnState.activeHost = null;
     cdnState.lastProbeUrl = null;
     codecState.stripped = 0;
     codecState.picked = null;
     codecState.offered = [];
     codecState.efficient = null;
+    resetPlaybackTracking(document.querySelector('video'), STALL_LOAD_GRACE);
     renderHud(false);
     scheduleMediaWarning(mediaGeneration);
     console.log('[bili-boost] 新媒体状态已重置：' + reason);
@@ -419,41 +477,126 @@
   const isMedia = url => UPOS_HOST.test(url.hostname) && MEDIA_EXT.test(url.pathname);
   const shortName = host => host.replace(/^upos-[a-z]{2}-(mirror|upcdn)?/, '').split('.')[0];
   const isPlayurl = url => /\/playurl/.test(String(url));
+  const hostFamily = host => host.endsWith('.bilivideo.com') ? 'bilivideo'
+    : host.endsWith('.akamaized.net') ? 'akamai' : 'other';
+  const canRewriteHost = (from, to) => from === to ||
+    (hostFamily(from) === 'bilivideo' && hostFamily(to) === 'bilivideo');
+  function compatibleHostPool(origHost = cdnState.lastResults?.origHost || cdnState.lastProbeUrl?.hostname) {
+    if (!origHost) return [];
+    return [origHost, ...CANDIDATES].filter((host, index, all) =>
+      all.indexOf(host) === index && UPOS_HOST.test(host) && canRewriteHost(origHost, host));
+  }
+  const currentCdnSource = (key = cdnState.curKey) => key
+    ? (cdnState.manual.get(key) || cdnState.activeHost || cdnState.picked.get(key) || null)
+    : cdnState.lastWinner;
+  function clearCdnCache(key) {
+    try { sessionStorage.removeItem('biliCdn:' + key); } catch (e) { }
+  }
 
-  // ---- CDN：单个候选测速 ----
-  async function probeCdn(url, host, bytes) {
+  function probeMetrics(got, firstChunkBytes, started, firstAt, ended) {
+    const totalMs = Math.max(1, ended - started);
+    const ttfb = firstAt == null ? null : Math.max(0, Math.round(firstAt - started));
+    const afterFirst = Math.max(0, got - firstChunkBytes);
+    const transferMs = firstAt == null ? 0 : ended - firstAt;
+    // 去掉等待首字节和首块，得到较纯的传输吞吐；样本太短时退回端到端速度。
+    const kbps = afterFirst >= 32768 && transferMs >= 10
+      ? Math.round(afterFirst / 1024 / (transferMs / 1000))
+      : Math.round(got / 1024 / (totalMs / 1000));
+    const effectiveKbps = Math.round(got / 1024 / (totalMs / 1000));
+    return {
+      kbps,
+      effectiveKbps,
+      ttfb,
+      deliveryMs: (ttfb || 0) + FULL_BYTES / 1024 / Math.max(1, kbps) * 1000,
+    };
+  }
+
+  // ---- CDN：单个候选、单个位置测速 ----
+  async function probeCdn(url, host, bytes, { offset = 0, point = '头部' } = {}) {
     const target = new URL(url.toString());
     target.hostname = host;
     const ctl = new AbortController();
     const timer = setTimeout(() => ctl.abort(), PROBE_TIMEOUT);
+    const headers = offset > 0 ? { Range: `bytes=${offset}-${offset + bytes - 1}` } : undefined;
     let got = 0;
+    let firstAt = null;
+    let firstChunkBytes = 0;
     const started = performance.now();
     try {
-      const res = await origFetch.call(window, target.toString(), { credentials: 'omit', cache: 'no-store', signal: ctl.signal });
+      const res = await origFetch.call(window, target.toString(), {
+        credentials: 'omit', cache: 'no-store', signal: ctl.signal, headers,
+      });
+      // 中段 Range 是额外诊断能力：服务器不支持或签名不允许时退回头部结果，
+      // 不能因此误判一个真实播放仍可用的 host 为坏源。
+      if (offset > 0 && res.status !== 206) {
+        res.body?.cancel().catch(() => { });
+        return { host, ok: false, skipped: true, kbps: 0, ttfb: Math.round(performance.now() - started), point,
+          note: `Range 不可用(HTTP ${res.status})` };
+      }
       if (!res.ok || !res.body) {
         cdnState.blacklist.add(host);
-        return { host, kbps: 0, note: 'HTTP ' + res.status };
+        return { host, ok: false, kbps: 0, ttfb: Math.round(performance.now() - started), point,
+          note: 'HTTP ' + res.status };
       }
       const reader = res.body.getReader();
       while (got < bytes) {
         const { done, value } = await reader.read();
         if (done) break;
+        const now = performance.now();
+        if (firstAt == null) {
+          firstAt = now;
+          firstChunkBytes = value.length;
+        }
         got += value.length;
       }
       reader.cancel().catch(() => { });
-      const dt = (performance.now() - started) / 1000;
-      if (got < 32768 || dt <= 0) return { host, kbps: 0, note: '数据不足' };
-      return { host, kbps: Math.round(got / 1024 / dt) };
-    } catch (e) {
-      if (e.name !== 'AbortError') cdnState.blacklist.add(host);
-      if (got >= 32768) {
-        const dt = (performance.now() - started) / 1000;
-        return { host, kbps: Math.round(got / 1024 / dt), note: '超时截断' };
+      const ended = performance.now();
+      if (got < 32768) {
+        return { host, ok: false, skipped: offset > 0, kbps: 0,
+          ttfb: firstAt == null ? Math.round(ended - started) : Math.round(firstAt - started), point,
+          note: offset > 0 ? '中段数据不足' : '数据不足' };
       }
-      return { host, kbps: 0, note: e.name === 'AbortError' ? '超时' : '失败' };
+      return { host, ok: true, ...probeMetrics(got, firstChunkBytes, started, firstAt, ended), bytes: got, point };
+    } catch (e) {
+      const ended = performance.now();
+      // 无数据的中段请求可能只是浏览器/服务端不接受 Range，保守退回头部，不污染黑名单。
+      if (offset > 0 && got === 0 && e.name !== 'AbortError') {
+        return { host, ok: false, skipped: true, kbps: 0, ttfb: Math.round(ended - started), point,
+          note: 'Range 请求失败' };
+      }
+      if (offset === 0 && e.name !== 'AbortError') cdnState.blacklist.add(host);
+      const metrics = got >= 32768
+        ? probeMetrics(got, firstChunkBytes, started, firstAt, ended)
+        : { kbps: 0, effectiveKbps: 0, ttfb: firstAt == null ? Math.round(ended - started) : Math.round(firstAt - started), deliveryMs: Infinity };
+      return { host, ok: false, ...metrics, bytes: got, point,
+        note: e.name === 'AbortError' ? (got ? '超时截断' : '超时') : '失败' };
     } finally {
       clearTimeout(timer);
     }
+  }
+
+  async function probePrecision(url, host) {
+    const head = await probeCdn(url, host, PRECISION_POINT_BYTES, { point: '头' });
+    if (!probeSucceeded(head)) {
+      return { ...head, stage: '精测(头+中)', points: [head], note: '头部' + (head.note || '失败') };
+    }
+    const middle = await probeCdn(url, host, PRECISION_POINT_BYTES,
+      { offset: MID_RANGE_OFFSET, point: '中' });
+    const points = [head, middle];
+    const usable = points.filter(probeSucceeded);
+    const ok = probeSucceeded(head) && (middle.skipped || probeSucceeded(middle));
+    return {
+      host,
+      ok,
+      kbps: Math.min(...usable.map(item => item.kbps)),
+      effectiveKbps: Math.min(...usable.map(item => item.effectiveKbps || item.kbps)),
+      ttfb: Math.max(...usable.map(item => Number.isFinite(item.ttfb) ? item.ttfb : 0)),
+      deliveryMs: Math.max(...usable.map(deliveryMs)),
+      bytes: usable.reduce((sum, item) => sum + (item.bytes || 0), 0),
+      stage: '精测(头+中)',
+      points,
+      note: ok ? (middle.skipped ? '中段' + middle.note : '') : '中段' + (middle.note || '失败'),
+    };
   }
 
   // ---- CDN：两阶段测速 ----
@@ -466,8 +609,8 @@
     try {
       const origHost = url.hostname;
       const bad = cdnState.rejected.get(key) || new Set();
-      const pool = [origHost, ...CANDIDATES].filter(
-        (host, index, all) => all.indexOf(host) === index && !cdnState.blacklist.has(host) && !bad.has(host)
+      const pool = compatibleHostPool(origHost).filter(host =>
+        !cdnState.blacklist.has(host) && !bad.has(host)
       );
       if (!pool.length) return;
 
@@ -487,8 +630,7 @@
       for (const finalist of finalists) {
         const latestBad = cdnState.rejected.get(key);
         if (cdnState.blacklist.has(finalist.host) || (latestBad && latestBad.has(finalist.host))) continue;
-        const result = await probeCdn(url, finalist.host, FULL_BYTES);
-        result.stage = '精测';
+        const result = await probePrecision(url, finalist.host);
         recordProbe(result);
         full.push(result);
         if (generation !== mediaGeneration) return;
@@ -503,12 +645,14 @@
       const best = eligible[0];
       if (!best || generation !== mediaGeneration) return;
       const orig = eligible.find(result => result.host === origHost);
-      // 原始源保护只在同一健康档内生效，否则会反过来覆盖“稳定性优先”。
+      // 原始源保护只在同一健康档内生效；候选的估算交付时间至少快 25% 才切走。
       const keepOrig = orig && healthTier(orig.host) === healthTier(best.host) &&
-        best.kbps <= orig.kbps * MIN_GAIN;
+        deliveryMs(best) >= deliveryMs(orig) / MIN_GAIN;
       const win = keepOrig ? origHost : best.host;
 
-      cdnState.picked.set(key, win);
+      // 用户在测速期间手选了源时，只更新自动结论和缓存，不夺回控制权。
+      const manualHost = cdnState.manual.get(key);
+      if (!manualHost) cdnState.picked.set(key, win);
       saveCdnCache(key, win);
       if (win !== origHost) {
         cdnState.lastWinner = win;
@@ -519,16 +663,43 @@
         try { localStorage.removeItem('biliCdnWinner'); } catch (e) { }
       }
       cdnState.lastResults = { list: merged, win, origHost, why, ts: Date.now() };
-      cdnState.perf.length = 0;
+      if (!manualHost) cdnState.perf.length = 0;
       console.log('[bili-cdn] 测速(' + why + ')',
-        merged.map(result => `${shortName(result.host)}=${result.kbps}KB/s${result.note ? '(' + result.note + ')' : '(' + result.stage + ')'}`).join('  '),
-        '→ 选用', win);
+        merged.map(result => `${shortName(result.host)}=${result.kbps}KB/s TTFB=${result.ttfb ?? '—'}ms` +
+          (result.note ? '(' + result.note + ')' : '(' + result.stage + ')')).join('  '),
+        '→ 自动选择', win, manualHost ? `（手选 ${manualHost} 保持不变）` : '');
       renderHud(true);
     } finally {
       // 一轮快筛 + 精测只落盘一次，避免每个候选都同步写 localStorage。
       saveHealth();
       cdnState.probing.delete(probeKey);
     }
+  }
+
+  function selectManualSource(host) {
+    const key = cdnState.curKey;
+    if (!key || !compatibleHostPool().includes(host)) return '只能选择当前媒体的兼容源';
+    cdnState.blacklist.delete(host);
+    cdnState.rejected.get(key)?.delete(host);
+    cdnState.manual.set(key, host);
+    cdnState.picked.set(key, host);
+    cdnState.perf.length = 0;
+    suppressStallChecks(STALL_LOAD_GRACE);
+    renderHud(false);
+    return '已手动切到 ' + host;
+  }
+
+  function restoreAutomaticSource() {
+    const key = cdnState.curKey;
+    if (!key) return '还没拦到分片';
+    cdnState.manual.delete(key);
+    cdnState.picked.delete(key);
+    clearCdnCache(key);
+    cdnState.perf.length = 0;
+    suppressStallChecks(STALL_LOAD_GRACE);
+    if (cdnState.lastProbeUrl) runCdnProbe(cdnState.lastProbeUrl, '恢复自动');
+    renderHud(false);
+    return '已恢复自动测速';
   }
 
   // 请求阶段只调用此函数，不接触播放信息响应。
@@ -544,25 +715,39 @@
     cdnState.missedWarning = false;
     cdnState.curKey = key;
     cdnState.lastProbeUrl = new URL(url.toString());
-    let target = cdnState.picked.get(key) || loadCdnCache(key);
-    if (target) cdnState.picked.set(key, target);
+    let target = cdnState.manual.get(key) || cdnState.picked.get(key) || loadCdnCache(key);
+    if (target && canRewriteHost(url.hostname, target)) cdnState.picked.set(key, target);
+    else if (target) {
+      target = null;
+      cdnState.manual.delete(key);
+      cdnState.picked.delete(key);
+      clearCdnCache(key);
+    }
 
     const bad = cdnState.rejected.get(key);
     if (target && (cdnState.blacklist.has(target) || (bad && bad.has(target)))) {
       target = null;
+      cdnState.manual.delete(key);
       cdnState.picked.delete(key);
-      try { sessionStorage.removeItem('biliCdn:' + key); } catch (e) { }
+      clearCdnCache(key);
     }
     if (!target) {
       runCdnProbe(url, '开播');
       target = cdnState.lastWinner;
-      if (target && !cdnState.blacklist.has(target) && !(bad && bad.has(target))) {
+      if (target && canRewriteHost(url.hostname, target) &&
+          !cdnState.blacklist.has(target) && !(bad && bad.has(target))) {
         // 记录测速完成前使用的会话赢家，让真实卡顿可以立即淘汰它。
         cdnState.picked.set(key, target);
       } else {
+        if (target && target === cdnState.lastWinner) {
+          // v1.3 可能留下跨域族 Akamai 赢家；升级后第一次遇到就迁移清掉。
+          cdnState.lastWinner = null;
+          try { localStorage.removeItem('biliCdnWinner'); } catch (e) { }
+        }
         target = null;
       }
     }
+    cdnState.activeHost = target || url.hostname;
     if (!target || target === url.hostname) return raw;
     url.hostname = target;
     return url.toString();
@@ -651,6 +836,53 @@
   const XHR_PLAYURL = Symbol('biliBoostPlayurl');
   const XHR_CDN = Symbol('biliBoostCdn');
   const XHR_RESPONSE_HOOKED = Symbol('biliBoostResponseHooked');
+
+  function recordRealTransfer(request, got, started, firstAt, firstChunkBytes, ended, via) {
+    if (request.generation !== mediaGeneration || request.key !== cdnState.curKey ||
+        got <= 65536 || ended - started <= 50) return;
+    const metrics = probeMetrics(got, firstChunkBytes, started, firstAt, ended);
+    cdnState.perf.push({ host: request.host, kbps: metrics.kbps, effectiveKbps: metrics.effectiveKbps,
+      ttfb: metrics.ttfb, bytes: got, via });
+    if (cdnState.perf.length > PERF_WINDOW) cdnState.perf.shift();
+    renderHud(false);
+  }
+
+  // clone() 保留原 Response 的 url/type/redirected/body 语义；只流式读取副本计数，不缓存整段。
+  // 超时或超过 32MB 就取消观测分支，绝不 abort 播放器持有的原分支。
+  function observeFetchSegment(response, request, started) {
+    if (!response?.ok || !response.body) return;
+    let clone;
+    try { clone = response.clone(); } catch (e) { return; }
+    if (!clone.body) return;
+    const reader = clone.body.getReader();
+    let got = 0;
+    let firstAt = null;
+    let firstChunkBytes = 0;
+    let finished = false;
+    const timer = setTimeout(() => {
+      if (!finished) reader.cancel('bili-boost measure timeout').catch(() => { });
+    }, FETCH_MEASURE_TIMEOUT);
+    (async () => {
+      try {
+        while (got < FETCH_MEASURE_MAX_BYTES) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          const now = performance.now();
+          if (firstAt == null) {
+            firstAt = now;
+            firstChunkBytes = value.length;
+          }
+          got += value.length;
+        }
+        if (got >= FETCH_MEASURE_MAX_BYTES) reader.cancel('bili-boost measure limit').catch(() => { });
+      } catch (e) { /* 观测失败不能影响原响应 */ }
+      finally {
+        finished = true;
+        clearTimeout(timer);
+        recordRealTransfer(request, got, started, firstAt, firstChunkBytes, performance.now(), 'fetch');
+      }
+    })();
+  }
   XMLHttpRequest.prototype.open = function (method, rawUrl, ...rest) {
     // XMLHttpRequest 可以复用；清掉上一次 playurl 请求装在实例上的 getter 和状态。
     if (this[XHR_RESPONSE_HOOKED]) {
@@ -658,13 +890,17 @@
       try { delete this.response; } catch (e) { }
       this[XHR_RESPONSE_HOOKED] = false;
     }
-    const playurl = codecActive() && isVideoPage() && isPlayurl(rawUrl);
+    const playerData = isVideoPage() && isPlayurl(rawUrl);
+    const playurl = codecActive() && playerData;
+    if (playerData) suppressStallChecks(STALL_LOAD_GRACE);
     const out = typeof rawUrl === 'string' || rawUrl instanceof URL ? rewriteSegmentUrl(rawUrl) : rawUrl;
     this[XHR_PLAYURL] = playurl;
     this[XHR_CDN] = null;
     try {
       const url = new URL(out, location.href);
-      if (isMedia(url)) this[XHR_CDN] = { host: url.hostname, url };
+      if (isMedia(url)) this[XHR_CDN] = {
+        host: url.hostname, url, key: keyOf(url), generation: mediaGeneration,
+      };
     } catch (e) { }
     return origOpen.call(this, method, out, ...rest);
   };
@@ -673,13 +909,19 @@
     const cdnRequest = this[XHR_CDN];
     if (cdnRequest) {
       const started = performance.now();
-      this.addEventListener('loadend', event => {
-        const seconds = (performance.now() - started) / 1000;
-        if (event.loaded > 65536 && seconds > 0.05) {
-          cdnState.perf.push({ host: cdnRequest.host, kbps: Math.round(event.loaded / 1024 / seconds) });
-          if (cdnState.perf.length > PERF_WINDOW) cdnState.perf.shift();
-          renderHud(false);
+      let firstAt = null;
+      let firstLoaded = 0;
+      const onProgress = event => {
+        if (firstAt == null && event.loaded > 0) {
+          firstAt = performance.now();
+          firstLoaded = event.loaded;
         }
+      };
+      this.addEventListener('progress', onProgress);
+      this.addEventListener('loadend', event => {
+        this.removeEventListener('progress', onProgress);
+        recordRealTransfer(cdnRequest, event.loaded, started, firstAt, firstLoaded,
+          performance.now(), 'xhr');
       }, { once: true });
     }
 
@@ -725,14 +967,26 @@
 
   window.fetch = async function (input, init) {
     const originalUrl = typeof input === 'string' || input instanceof URL ? String(input) : (input && input.url) || '';
+    const playerData = isVideoPage() && isPlayurl(originalUrl);
+    if (playerData) suppressStallChecks(STALL_LOAD_GRACE);
     if (typeof input === 'string' || input instanceof URL) {
       input = rewriteSegmentUrl(input);
     } else if (input instanceof Request) {
       const rewritten = rewriteSegmentUrl(input.url);
       if (rewritten !== input.url) input = new Request(rewritten, input);
     }
+    let cdnRequest = null;
+    try {
+      const requestUrl = new URL(typeof input === 'string' || input instanceof URL ? String(input) : input.url, location.href);
+      const method = String(init?.method || (input instanceof Request ? input.method : 'GET')).toUpperCase();
+      if (method === 'GET' && isMedia(requestUrl)) cdnRequest = {
+        host: requestUrl.hostname, url: requestUrl, key: keyOf(requestUrl), generation: mediaGeneration,
+      };
+    } catch (e) { }
+    const started = cdnRequest ? performance.now() : 0;
     const response = await origFetch.call(this, input, init);
-    if (!codecActive() || !isVideoPage() || !isPlayurl(originalUrl)) return response;
+    if (cdnRequest) observeFetchSegment(response, cdnRequest, started);
+    if (!codecActive() || !playerData) return response;
     try {
       const body = JSON.stringify(rewritePlayinfo(await response.clone().json()));
       const headers = new Headers(response.headers);
@@ -753,6 +1007,7 @@
     MediaSource.prototype.addSourceBuffer = function (mime) {
       if (/video\//i.test(String(mime))) {
         syncMediaIdentity();
+        suppressStallChecks(STALL_LOAD_GRACE);
         codecState.picked = String(mime);
         codecState.efficient = null;
         queueMicrotask(updateCodecStatus);
@@ -805,29 +1060,138 @@
     renderHud(false);
   }
 
-  // ---- 播放闭环：真卡了就换源 ----
-  function onStall() {
+  // ---- 播放闭环：事件先去误报，再确认真卡顿 ----
+  function cancelPendingStall() {
+    if (!playbackState.pending) return;
+    clearTimeout(playbackState.pending.timer);
+    playbackState.pending = null;
+  }
+
+  function suppressStallChecks(ms = STALL_LOAD_GRACE) {
+    playbackState.suppressUntil = Math.max(playbackState.suppressUntil, performance.now() + ms);
+    cancelPendingStall();
+  }
+
+  function resetPlaybackTracking(video, grace = STALL_LOAD_GRACE) {
+    cancelPendingStall();
+    playbackState.video = video || null;
+    playbackState.hasAdvanced = false;
+    playbackState.lastTime = Number(video?.currentTime) || 0;
+    playbackState.lastAdvanceAt = 0;
+    playbackState.suppressUntil = performance.now() + grace;
+  }
+
+  function bufferAhead(video) {
+    try {
+      for (let i = 0; i < video.buffered.length; i++) {
+        if (video.buffered.start(i) <= video.currentTime + 0.25 &&
+            video.buffered.end(i) >= video.currentTime) return video.buffered.end(i) - video.currentTime;
+      }
+    } catch (e) { }
+    return 0;
+  }
+
+  function confirmCdnStall(key, current) {
+    const now = Date.now();
+    if (now - playbackState.lastConfirmedAt < STALL_DEDUP_MS) return;
+    playbackState.lastConfirmedAt = now;
     cdnState.stalls++;
     renderHud(false);
-    const key = cdnState.curKey;
-    const current = key && cdnState.picked.get(key);
-    if (!current || Date.now() - cdnState.lastRetest < RETEST_COOLDOWN) return;
-    cdnState.lastRetest = Date.now();
+    if (!current || now - cdnState.lastRetest < RETEST_COOLDOWN) return;
+    cdnState.lastRetest = now;
     if (!cdnState.rejected.has(key)) cdnState.rejected.set(key, new Set());
     cdnState.rejected.get(key).add(current);
+    cdnState.manual.delete(key);
     cdnState.picked.delete(key);
-    try { sessionStorage.removeItem('biliCdn:' + key); } catch (e) { }
-    console.warn('[bili-cdn] 卡顿 → 弃用', current, '重新测速');
+    if (cdnState.activeHost === current) cdnState.activeHost = null;
+    clearCdnCache(key);
+    cdnState.perf.length = 0;
+    console.warn('[bili-cdn] 确认卡顿 → 弃用', current, '重新测速');
     if (cdnState.lastProbeUrl) runCdnProbe(cdnState.lastProbeUrl, '卡顿重测');
   }
-  document.addEventListener('waiting', onStall, true);
-  document.addEventListener('stalled', onStall, true);
 
-  function medianKbps() {
-    if (!cdnState.perf.length) return null;
-    const values = cdnState.perf.map(item => item.kbps).sort((a, b) => a - b);
-    return values[Math.floor(values.length / 2)];
+  function onPotentialStall(event) {
+    const video = event.target;
+    if (!(video instanceof HTMLVideoElement)) return;
+    if (playbackState.video !== video) {
+      resetPlaybackTracking(video);
+      return;
+    }
+    const now = performance.now();
+    const key = cdnState.curKey;
+    const current = currentCdnSource(key);
+    if (!key || !current || !playbackState.hasAdvanced || now < playbackState.suppressUntil ||
+        video.paused || video.ended || video.seeking || video.readyState >= 3 || bufferAhead(video) > 0.75 ||
+        playbackState.pending) return;
+
+    const snapshot = {
+      generation: mediaGeneration,
+      key,
+      current,
+      time: video.currentTime,
+      started: now,
+      timer: null,
+    };
+    snapshot.timer = setTimeout(() => {
+      if (playbackState.pending !== snapshot) return;
+      playbackState.pending = null;
+      if (snapshot.generation !== mediaGeneration || playbackState.video !== video ||
+          snapshot.key !== cdnState.curKey || snapshot.current !== currentCdnSource(snapshot.key) ||
+          performance.now() < playbackState.suppressUntil || playbackState.lastAdvanceAt > snapshot.started ||
+          video.paused || video.ended || video.seeking || video.readyState >= 3 ||
+          Math.abs(video.currentTime - snapshot.time) >= 0.1 || bufferAhead(video) > 0.75) return;
+      confirmCdnStall(snapshot.key, snapshot.current);
+    }, STALL_CONFIRM_MS);
+    playbackState.pending = snapshot;
   }
+
+  function onPlaybackProgress(event) {
+    const video = event.target;
+    if (!(video instanceof HTMLVideoElement)) return;
+    if (playbackState.video !== video) resetPlaybackTracking(video, 0);
+    const current = Number(video.currentTime) || 0;
+    const delta = current - playbackState.lastTime;
+    if (!video.seeking && delta >= 0.05 && delta < 1.5) {
+      playbackState.hasAdvanced = true;
+      playbackState.lastAdvanceAt = performance.now();
+      if (playbackState.pending && Math.abs(current - playbackState.pending.time) >= 0.1) cancelPendingStall();
+    }
+    playbackState.lastTime = current;
+  }
+
+  function onMediaLifecycle(event) {
+    const video = event.target;
+    if (!(video instanceof HTMLVideoElement)) return;
+    if (event.type === 'emptied' || event.type === 'loadstart') {
+      resetPlaybackTracking(video);
+    } else if (event.type === 'seeking') {
+      suppressStallChecks(STALL_SEEK_GRACE);
+      playbackState.lastTime = Number(video.currentTime) || 0;
+    } else if (event.type === 'seeked') {
+      suppressStallChecks(1000);
+      playbackState.lastTime = Number(video.currentTime) || 0;
+    } else {
+      cancelPendingStall();
+    }
+  }
+
+  document.addEventListener('waiting', onPotentialStall, true);
+  document.addEventListener('stalled', onPotentialStall, true);
+  document.addEventListener('timeupdate', onPlaybackProgress, true);
+  for (const type of ['playing', 'canplay', 'seeking', 'seeked', 'loadstart', 'emptied']) {
+    document.addEventListener(type, onMediaLifecycle, true);
+  }
+
+  function currentPerf() {
+    const current = currentCdnSource();
+    return current ? cdnState.perf.filter(item => item.host === current) : [];
+  }
+  function medianMetric(name) {
+    const values = currentPerf().map(item => item[name]).filter(Number.isFinite).sort((a, b) => a - b);
+    return values.length ? values[Math.floor(values.length / 2)] : null;
+  }
+  function medianKbps() { return medianMetric('kbps'); }
+  function medianTtfb() { return medianMetric('ttfb'); }
   function efficiencyText() {
     if (codecState.efficient === true) return ['🟢 硬解', '#6c6'];
     if (codecState.efficient === false) return ['🔴 软解', '#f66'];
@@ -857,7 +1221,18 @@
       'border:1px solid rgba(255,255,255,.08);' +
       'box-shadow:0 3px 14px rgba(0,0,0,.5);white-space:pre;transition:opacity .4s;cursor:pointer;user-select:none';
     box.addEventListener('click', event => {
-      const action = event.target.closest('[data-action]')?.dataset.action;
+      const actionNode = event.target.closest('[data-action]');
+      const action = actionNode?.dataset.action;
+      if (action === 'source') {
+        event.stopPropagation();
+        selectManualSource(actionNode.dataset.host);
+        return;
+      }
+      if (action === 'auto-source') {
+        event.stopPropagation();
+        restoreAutomaticSource();
+        return;
+      }
       if (action === 'codec') {
         event.stopPropagation();
         codecMode = codecMode === 'auto' ? true : codecMode === true ? false : 'auto';
@@ -895,11 +1270,15 @@
     }
     if (expand) hudExpanded = true;
     const box = ensureHud();
-    const current = (cdnState.curKey && cdnState.picked.get(cdnState.curKey)) || cdnState.lastWinner;
+    const current = currentCdnSource();
+    const manual = cdnState.curKey && cdnState.manual.get(cdnState.curKey);
     const real = medianKbps();
+    const realTtfb = medianTtfb();
     const cdnLine = (cdnState.missedWarning ? '<span style="color:#ec9">⚠️ 没拦到分片请求</span> · ' : '') +
       `<b style="color:#fb7299">${current ? shortName(current) : '未选源'}</b>` +
-      (real ? ` · 实测 <b style="color:${real > 400 ? '#6c6' : '#ec9'}">${real}</b> KB/s` : ' · 实测 —') +
+      (manual ? ' <span style="color:#8cf">(手选)</span>' : '') +
+      (real != null ? ` · 实测 <b style="color:${real > 400 ? '#6c6' : '#ec9'}">${real}</b> KB/s` : ' · 实测 —') +
+      (realTtfb != null ? ` · TTFB ${realTtfb}ms` : '') +
       (cdnState.stalls ? ` · <span style="color:#f66">卡顿 ${cdnState.stalls}</span>` : ' · 卡顿 0');
     const [status, statusColor] = efficiencyText();
     const codecLine = `<span style="color:${statusColor}">${status}</span> · ${codecLabel(codecState.picked)}`;
@@ -913,24 +1292,47 @@
       return;
     }
 
-    let probeRows = '<span style="color:#888">尚无测速结果</span>';
+    const sourceLink = host => `<span data-action="source" data-host="${host}" style="color:#8cf">${shortName(host).padEnd(7)}</span>`;
+    let probeRows = '<span style="color:#888">尚无完整测速结果</span>';
+    const shownHosts = new Set();
     if (cdnState.lastResults) {
       probeRows = cdnState.lastResults.list.map(result => {
-        const mark = result.host === cdnState.lastResults.win ? '✅' : (result.host === cdnState.lastResults.origHost ? '原' : '　');
-        const color = result.kbps === 0 ? '#f66' : result.kbps > 400 ? '#6c6' : '#ec9';
-        const tag = result.note ? result.note : result.stage;
-        return `${mark} ${shortName(result.host).padEnd(7)} <span style="color:${color}">${String(result.kbps).padStart(5)}</span> KB/s <span style="color:#888">${tag}</span>`;
+        shownHosts.add(result.host);
+        const selectedManually = result.host === manual;
+        const mark = selectedManually ? '🖐' : result.host === cdnState.lastResults.win ? '✅'
+          : (result.host === cdnState.lastResults.origHost ? '原' : '　');
+        const color = !probeSucceeded(result) ? '#f66' : result.kbps > 400 ? '#6c6' : '#ec9';
+        const tag = result.note || result.stage;
+        const ttfb = Number.isFinite(result.ttfb) ? ` · ${String(result.ttfb).padStart(4)}ms` : '';
+        let row = `${mark} ${sourceLink(result.host)} <span style="color:${color}">${String(result.kbps || 0).padStart(5)}</span> KB/s${ttfb} <span style="color:#888">${tag}</span>`;
+        if (result.points?.length > 1) {
+          row += '<br><span style="color:#777">　↳ ' + result.points.map(point =>
+            `${point.point} ${point.kbps || 0}KB/s/${Number.isFinite(point.ttfb) ? point.ttfb + 'ms' : '—'}${point.note ? '(' + point.note + ')' : ''}`
+          ).join(' · ') + '</span>';
+        }
+        return row;
       }).join('<br>');
       if (cdnState.lastResults.win === cdnState.lastResults.origHost) {
         probeRows += '<br><span style="color:#888">原始源够快，未改写</span>';
       }
+    }
+    const unlisted = compatibleHostPool().filter(host => !shownHosts.has(host));
+    if (unlisted.length) {
+      probeRows += '<br>' + unlisted.map(host =>
+        `${host === manual ? '🖐' : '　'} ${sourceLink(host)} <span style="color:#777">未进入本轮测速，可强制尝试</span>`
+      ).join('<br>');
+    }
+    if (cdnState.lastResults || unlisted.length) {
+      probeRows += manual
+        ? '<br><span data-action="auto-source" style="color:#8cf">恢复自动测速（点击）</span>'
+        : '<br><span style="color:#777">点击蓝色源可手动切线</span>';
     }
     const offered = codecState.offered.length ? codecState.offered.join(' / ') : '—';
     const conflictDetails = legacyConflict.detected
       ? `${conflictLine}<br><span style="color:#ec9">可能位置：Userscripts / AdGuard → Extensions / Tampermonkey</span>` +
         `<hr style="border:0;border-top:1px solid #444;margin:5px 0">`
       : '';
-    box.innerHTML = conflictDetails + `<span style="color:#888">CDN 测速${cdnState.lastResults ? '(' + cdnState.lastResults.why + ') · 精测为准' : ''}</span><br>${probeRows}` +
+    box.innerHTML = conflictDetails + `<span style="color:#888">CDN 测速${cdnState.lastResults ? '(' + cdnState.lastResults.why + ') · 精测=头部+1MB中段，显示净吞吐/TTFB' : ''}</span><br>${probeRows}` +
       `<hr style="border:0;border-top:1px solid #444;margin:5px 0"><span style="color:#888">编码信息</span><br>` +
       `${codecLine}<br>编码：${codecLabel(codecState.picked)}<br>powerEfficient：${codecState.efficient == null ? '未知' : codecState.efficient}<br>` +
       `已剔除 AV1：${codecState.stripped} 条<br>B站提供：${offered}` +
@@ -950,20 +1352,33 @@
 
   // ---- 调试接口：原 __biliCdn 八项保持不变，在其上增加编码字段 ----
   debugApi = {
-    get 当前源() { return (cdnState.curKey && cdnState.picked.get(cdnState.curKey)) || cdnState.lastWinner; },
-    get 实测速度() { return medianKbps() + ' KB/s（最近 ' + cdnState.perf.length + ' 个分片中位数）'; },
+    get 当前源() { return currentCdnSource(); },
+    get 手动源() { return cdnState.curKey ? cdnState.manual.get(cdnState.curKey) || null : null; },
+    get 实测速度() {
+      const value = medianKbps();
+      return (value == null ? '—' : value) + ' KB/s（当前源最近 ' + currentPerf().length + ' 个分片中位数）';
+    },
+    get 首字节延迟() {
+      const value = medianTtfb();
+      return value == null ? '—' : value + ' ms（当前源分片中位数）';
+    },
     get 分片明细() { return cdnState.perf.slice(); },
     get 测速结果() { return cdnState.lastResults; },
     get 卡顿次数() { return cdnState.stalls; },
     get 黑名单() { return [...cdnState.blacklist]; },
     重测() {
       if (cdnState.lastProbeUrl) {
+        cdnState.manual.delete(cdnState.curKey);
         cdnState.picked.delete(cdnState.curKey);
+        clearCdnCache(cdnState.curKey);
+        cdnState.perf.length = 0;
         runCdnProbe(cdnState.lastProbeUrl, '手动');
         return '测速中…';
       }
       return '还没拦到分片';
     },
+    手动选源(host) { return selectManualSource(String(host || '')); },
+    自动选源() { return restoreAutomaticSource(); },
     面板(on) { return setHudEnabled(on) ? '已开' : '已关'; },
     get 当前编码() { return codecState.picked; },
     get 编码名称() { return codecLabel(codecState.picked); },
@@ -976,7 +1391,8 @@
         const r = health[host];
         out[shortName(host)] = `${r.successes}/${r.attempts} 成功` +
           (r.attempts >= HEALTH_MIN_ATTEMPTS ? ` (${Math.round(r.successes / r.attempts * 100)}%)` : ' (样本不足)') +
-          (r.kbps ? ` · 滑动均速 ${r.kbps}KB/s` : '');
+          (r.kbps ? ` · 滑动均速 ${r.kbps}KB/s` : '') +
+          (r.ttfb ? ` · TTFB ${r.ttfb}ms` : '');
       }
       return out;
     },
