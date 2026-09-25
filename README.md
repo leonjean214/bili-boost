@@ -10,6 +10,10 @@
 >
 > 仓库原名 `bili-cdn-switcher`，合并后改名为 `bili-boost`。GitHub 会自动重定向旧链接。
 
+### v1.5.1
+
+- Safari 兼容审计（见 `SAFARI-AUDIT-20260925.md`）：`addSourceBuffer` 钩子改为沿原型链同时覆盖 `MediaSource` / `ManagedMediaSource`，iPhone Safari（只有 ManagedMediaSource）不再因 `MediaSource` 未定义而中断初始化；HUD 补 `-webkit-user-select`。
+
 ### v1.5.0
 
 - 长时播放与 SPA 切视频会主动取消旧探测/观测、清理媒体态；所有动态 Map/Set/数组和待处理观测器均有硬上限。

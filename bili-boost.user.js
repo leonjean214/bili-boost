@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         哔哩哔哩播放优化（CDN 测速切源 + 强制硬解编码）
 // @namespace    https://github.com/leonjean214/bili-boost
-// @version      1.5.0
+// @version      1.5.1
 // @description  CDN 两阶段多点测速切源，并剔除 AV1、优先 HEVC/H.264，降低海外播放卡顿与软解发热。
 // @author       leonjean214
 // @match        *://*.bilibili.com/*
@@ -236,7 +236,7 @@
   // 但 B站有同源 iframe（如登录轮询用的 /correspond/），脚本在里面照样会跑，
   // 那里既不是视频页也拦不到分片。HUD 必须只由顶层窗口绘制，
   // 否则 iframe 会画出第二个 HUD，内容是「没拦到分片请求 / 未检测编码」。
-  const SCRIPT_VERSION = 'v1.5.0';   // ⚠️ 改版本时要和文件头的 @version 一起改
+  const SCRIPT_VERSION = 'v1.5.1';   // ⚠️ 改版本时要和文件头的 @version 一起改
 
   const IS_TOP = (() => { try { return window.top === window.self; } catch (e) { return false; } })();
 
@@ -1090,17 +1090,33 @@
     patchCodecStrategy();
     installPlayinfoHook();
 
-    const addSourceBuffer = MediaSource.prototype.addSourceBuffer;
-    MediaSource.prototype.addSourceBuffer = function (mime) {
-      if (/video\//i.test(String(mime))) {
-        syncMediaIdentity();
-        suppressStallChecks(STALL_LOAD_GRACE);
-        codecState.picked = String(mime);
-        codecState.efficient = null;
-        queueMicrotask(updateCodecStatus);
+    // Safari/WebKit：iPhone 只暴露 ManagedMediaSource，全局没有 MediaSource（MDN BCD：
+    // "Exposed in Mobile Safari on iPad but not on iPhone"）；macOS Safari 17+ 两者并存，
+    // 播放器可任选其一。旧写法直接读 MediaSource.prototype，在 iPhone 上抛 ReferenceError，
+    // 会把后面的卡顿监听、调试接口和 HUD 初始化整段打断。
+    // WebKit IDL 中 ManagedMediaSource 继承 MediaSource 且不重声明 addSourceBuffer，
+    // 所以沿原型链找到真正拥有该方法的原型，去重后每个只包一次；都不存在就跳过。
+    const sourceBufferProtos = new Set();
+    for (const Ctor of [window.MediaSource, window.ManagedMediaSource]) {
+      let proto = typeof Ctor === 'function' ? Ctor.prototype : null;
+      while (proto && !Object.prototype.hasOwnProperty.call(proto, 'addSourceBuffer')) {
+        proto = Object.getPrototypeOf(proto);
       }
-      return addSourceBuffer.call(this, mime);
-    };
+      if (proto && typeof proto.addSourceBuffer === 'function') sourceBufferProtos.add(proto);
+    }
+    for (const proto of sourceBufferProtos) {
+      const addSourceBuffer = proto.addSourceBuffer;
+      proto.addSourceBuffer = function (mime) {
+        if (/video\//i.test(String(mime))) {
+          syncMediaIdentity();
+          suppressStallChecks(STALL_LOAD_GRACE);
+          codecState.picked = String(mime);
+          codecState.efficient = null;
+          queueMicrotask(updateCodecStatus);
+        }
+        return addSourceBuffer.call(this, mime);
+      };
+    }
   }
 
   function codecLabel(mime) {
@@ -1306,7 +1322,9 @@
       '-webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px);' +
       'color:#ddd;font:11px/1.55 ui-monospace,Menlo,monospace;padding:6px 10px;border-radius:7px;' +
       'border:1px solid rgba(255,255,255,.08);' +
-      'box-shadow:0 3px 14px rgba(0,0,0,.5);white-space:pre;transition:opacity .4s;cursor:pointer;user-select:none';
+      'box-shadow:0 3px 14px rgba(0,0,0,.5);white-space:pre;transition:opacity .4s;cursor:pointer;' +
+      // Safari 至今只认带前缀的 -webkit-user-select（MDN BCD），否则连点 HUD 会选中文字。
+      '-webkit-user-select:none;user-select:none';
     box.addEventListener('click', event => {
       const actionNode = event.target.closest('[data-action]');
       const action = actionNode?.dataset.action;
