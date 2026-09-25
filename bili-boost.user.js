@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         哔哩哔哩播放优化（CDN 测速切源 + 强制硬解编码）
 // @namespace    https://github.com/leonjean214/bili-boost
-// @version      1.4.0
+// @version      1.5.0
 // @description  CDN 两阶段多点测速切源，并剔除 AV1、优先 HEVC/H.264，降低海外播放卡顿与软解发热。
 // @author       leonjean214
 // @match        *://*.bilibili.com/*
@@ -48,6 +48,7 @@
   // ---- 主机健康档案：跨会话统计成功率。稳定性优先于峰值速度——
   // 一台“70% 时候飞快、30% 超时”的主机，体验差于一台始终中等的主机。 ----
   const HEALTH_KEY = 'bhw_health';
+  const HEALTH_SCHEMA_VERSION = 2;
   const HEALTH_MIN_ATTEMPTS = 3;     // 样本不足先按最佳档探索；每轮快筛都会让它很快脱离该档
   const HEALTH_RATIO_DELTA = 0.15;   // 成功率分档宽度；同一档内再比本轮速度
   const HEALTH_MAX_AGE = 7 * 24 * 3600e3;
@@ -92,19 +93,30 @@
   }
 
   function loadHealth() {
-    try { return normalizeHealth(JSON.parse(localStorage.getItem(HEALTH_KEY) || '{}')); }
-    catch (e) { return Object.create(null); }
+    try {
+      const raw = JSON.parse(localStorage.getItem(HEALTH_KEY) || '{}');
+      // v1.3/v1.4 直接保存 host 字典；v1.5 用带版本的 envelope，读取时自动迁移并裁剪。
+      const current = raw?.version === HEALTH_SCHEMA_VERSION && raw.hosts && typeof raw.hosts === 'object';
+      return { records: normalizeHealth(current ? raw.hosts : raw), migrated: !current };
+    } catch (e) { return { records: Object.create(null), migrated: true }; }
   }
-  let health = loadHealth();
-  let healthDirty = false;
+  const loadedHealth = loadHealth();
+  let health = loadedHealth.records;
+  let healthDirty = loadedHealth.migrated;
   function saveHealth(force = false) {
     if (!force && !healthDirty) return;
     health = normalizeHealth(health);
     try {
-      localStorage.setItem(HEALTH_KEY, JSON.stringify(health));
+      localStorage.setItem(HEALTH_KEY, JSON.stringify({
+        version: HEALTH_SCHEMA_VERSION,
+        updatedAt: Date.now(),
+        hosts: health,
+      }));
       healthDirty = false;
     } catch (e) { }
   }
+  // 即使本会话没有测速，也把旧格式迁移成有版本、按 7 天和 32 条双上限裁剪的新格式。
+  if (healthDirty) saveHealth(true);
   function probeSucceeded(result) {
     // 超时只拿到一截数据仍可展示速度，但对“稳定可用”应记作失败。
     // note 只负责展示；Range 不可用等提示可以与成功状态并存。
@@ -187,8 +199,35 @@
     });
   }
 
-  const UPOS_HOST = /(^|\.)((upos-[a-z0-9-]+\.bilivideo\.com)|(upos-[a-z0-9-]+\.akamaized\.net))$/;
-  const MEDIA_EXT = /\.(m4s|mp4|flv)$/;
+  function isUposHost(host) {
+    const value = String(host).toLowerCase();
+    const suffix = value.endsWith('.bilivideo.com') ? '.bilivideo.com'
+      : value.endsWith('.akamaized.net') ? '.akamaized.net' : '';
+    if (!suffix) return false;
+    const label = value.slice(0, -suffix.length).split('.').pop() || '';
+    if (!label.startsWith('upos-') || label.length <= 5) return false;
+    for (let i = 5; i < label.length; i++) {
+      const code = label.charCodeAt(i);
+      if (code !== 45 && (code < 48 || code > 57) && (code < 97 || code > 122)) return false;
+    }
+    return true;
+  }
+  function hasMediaExtension(path) {
+    const value = String(path).toLowerCase();
+    return value.endsWith('.m4s') || value.endsWith('.mp4') || value.endsWith('.flv');
+  }
+  // 绝大多数 fetch/XHR 都不是分片；先做尾缀 O(1) 快筛，避免每次都构造 URL 再跑正则。
+  function looksLikeMediaRaw(raw) {
+    const value = typeof raw === 'string' || raw instanceof URL ? String(raw) : raw?.url;
+    if (!value) return false;
+    let end = value.length;
+    const query = value.indexOf('?');
+    const hash = value.indexOf('#');
+    if (query >= 0 && query < end) end = query;
+    if (hash >= 0 && hash < end) end = hash;
+    const tail = value.slice(Math.max(0, end - 5), end).toLowerCase();
+    return tail.endsWith('.m4s') || tail.endsWith('.mp4') || tail.endsWith('.flv');
+  }
   const VIDEO_PATH = /^\/(video\/|bangumi\/play\/|list\/|festival\/)/;
   const CODEC_NAME = { 7: 'AVC/H.264', 12: 'HEVC/H.265', 13: 'AV1' };
   const AV1 = 13;
@@ -197,7 +236,7 @@
   // 但 B站有同源 iframe（如登录轮询用的 /correspond/），脚本在里面照样会跑，
   // 那里既不是视频页也拦不到分片。HUD 必须只由顶层窗口绘制，
   // 否则 iframe 会画出第二个 HUD，内容是「没拦到分片请求 / 未检测编码」。
-  const SCRIPT_VERSION = 'v1.4.0';   // ⚠️ 改版本时要和文件头的 @version 一起改
+  const SCRIPT_VERSION = 'v1.5.0';   // ⚠️ 改版本时要和文件头的 @version 一起改
 
   const IS_TOP = (() => { try { return window.top === window.self; } catch (e) { return false; } })();
 
@@ -228,6 +267,9 @@
     curKey: null,
     activeHost: null,
     lastProbeUrl: null,
+    warningTimer: null,
+    activeProbeControllers: new Set(),
+    fetchObservers: new Set(),
   };
   const codecState = { stripped: 0, picked: null, offered: [], efficient: null };
   const playbackState = {
@@ -241,6 +283,7 @@
   };
   let mediaGeneration = 0;
   let currentMediaId = mediaIdentity();
+  let lastPlayRequestId = null;
 
   // hwdecode 原有的 localStorage fallback；页面上下文不依赖油猴存储 API。
   const configGet = (key, fallback) => {
@@ -424,6 +467,15 @@
   // 只清媒体态；全局赢家、黑名单和带 TTL 的缓存仍保持原脚本语义。
   function resetMediaState(reason, nextId = mediaIdentity()) {
     mediaGeneration++;
+    lastPlayRequestId = null;
+    if (cdnState.warningTimer) {
+      clearTimeout(cdnState.warningTimer);
+      cdnState.warningTimer = null;
+    }
+    for (const controller of cdnState.activeProbeControllers) controller.abort();
+    cdnState.activeProbeControllers.clear();
+    for (const observer of cdnState.fetchObservers) observer.cancel();
+    cdnState.fetchObservers.clear();
     currentMediaId = nextId;
     cdnState.rejected.clear();
     cdnState.picked.clear();
@@ -465,7 +517,9 @@
     // 只有顶层视频页才该提示「没拦到分片」。iframe 不显示 HUD，
     // 非视频页（首页/空间/动态）本来就没有分片请求，报了就是误报。
     if (!IS_TOP || !isVideoPage()) return;
-    setTimeout(() => {
+    if (cdnState.warningTimer) clearTimeout(cdnState.warningTimer);
+    cdnState.warningTimer = setTimeout(() => {
+      cdnState.warningTimer = null;
       if (generation !== mediaGeneration || cdnState.sawMedia) return;
       cdnState.missedWarning = true;
       console.warn('[bili-cdn] 5 秒内未拦截到 m4s/mp4/flv 请求');
@@ -473,10 +527,19 @@
     }, 5000);
   }
 
-  const keyOf = url => url.pathname.replace(/\/[^/]*$/, '');
-  const isMedia = url => UPOS_HOST.test(url.hostname) && MEDIA_EXT.test(url.pathname);
+  const keyOf = url => url.pathname.slice(0, Math.max(0, url.pathname.lastIndexOf('/')));
+  const isMedia = url => isUposHost(url.hostname) && hasMediaExtension(url.pathname);
   const shortName = host => host.replace(/^upos-[a-z]{2}-(mirror|upcdn)?/, '').split('.')[0];
-  const isPlayurl = url => /\/playurl/.test(String(url));
+  const isPlayurl = url => String(url).includes('/playurl');
+  function notePlayRequest(rawUrl) {
+    try {
+      const url = new URL(String(rawUrl), location.href);
+      const id = ['bvid', 'avid', 'cid', 'ep_id', 'qn', 'fnval']
+        .map(key => `${key}=${url.searchParams.get(key) || ''}`).join('&');
+      if (lastPlayRequestId !== null && id !== lastPlayRequestId) resetMediaState('分 P / 清晰度切换');
+      lastPlayRequestId = id;
+    } catch (e) { }
+  }
   const hostFamily = host => host.endsWith('.bilivideo.com') ? 'bilivideo'
     : host.endsWith('.akamaized.net') ? 'akamai' : 'other';
   const canRewriteHost = (from, to) => from === to ||
@@ -484,11 +547,16 @@
   function compatibleHostPool(origHost = cdnState.lastResults?.origHost || cdnState.lastProbeUrl?.hostname) {
     if (!origHost) return [];
     return [origHost, ...CANDIDATES].filter((host, index, all) =>
-      all.indexOf(host) === index && UPOS_HOST.test(host) && canRewriteHost(origHost, host));
+      all.indexOf(host) === index && isUposHost(host) && canRewriteHost(origHost, host));
   }
   const currentCdnSource = (key = cdnState.curKey) => key
     ? (cdnState.manual.get(key) || cdnState.activeHost || cdnState.picked.get(key) || null)
     : cdnState.lastWinner;
+  function addToBoundedSet(set, value, max = 64) {
+    if (set.has(value)) set.delete(value);
+    set.add(value);
+    while (set.size > max) set.delete(set.values().next().value);
+  }
   function clearCdnCache(key) {
     try { sessionStorage.removeItem('biliCdn:' + key); } catch (e) { }
   }
@@ -516,6 +584,7 @@
     const target = new URL(url.toString());
     target.hostname = host;
     const ctl = new AbortController();
+    cdnState.activeProbeControllers.add(ctl);
     const timer = setTimeout(() => ctl.abort(), PROBE_TIMEOUT);
     const headers = offset > 0 ? { Range: `bytes=${offset}-${offset + bytes - 1}` } : undefined;
     let got = 0;
@@ -534,7 +603,7 @@
           note: `Range 不可用(HTTP ${res.status})` };
       }
       if (!res.ok || !res.body) {
-        cdnState.blacklist.add(host);
+        addToBoundedSet(cdnState.blacklist, host);
         return { host, ok: false, kbps: 0, ttfb: Math.round(performance.now() - started), point,
           note: 'HTTP ' + res.status };
       }
@@ -564,7 +633,7 @@
         return { host, ok: false, skipped: true, kbps: 0, ttfb: Math.round(ended - started), point,
           note: 'Range 请求失败' };
       }
-      if (offset === 0 && e.name !== 'AbortError') cdnState.blacklist.add(host);
+      if (offset === 0 && e.name !== 'AbortError') addToBoundedSet(cdnState.blacklist, host);
       const metrics = got >= 32768
         ? probeMetrics(got, firstChunkBytes, started, firstAt, ended)
         : { kbps: 0, effectiveKbps: 0, ttfb: firstAt == null ? Math.round(ended - started) : Math.round(firstAt - started), deliveryMs: Infinity };
@@ -572,6 +641,7 @@
         note: e.name === 'AbortError' ? (got ? '超时截断' : '超时') : '失败' };
     } finally {
       clearTimeout(timer);
+      cdnState.activeProbeControllers.delete(ctl);
     }
   }
 
@@ -704,6 +774,7 @@
 
   // 请求阶段只调用此函数，不接触播放信息响应。
   function rewriteSegmentUrl(raw) {
+    if (!looksLikeMediaRaw(raw)) return raw;
     let url;
     try { url = new URL(raw, location.href); } catch (e) { return raw; }
     if (!isMedia(url)) return raw;
@@ -763,7 +834,7 @@
       if (!data || !data.dash || !Array.isArray(data.dash.video) || !data.dash.video.length) return payload;
 
       const all = data.dash.video;
-      codecState.offered = [...new Set(all.map(item => CODEC_NAME[item.codecid] || item.codecid))];
+      codecState.offered = [...new Set(all.slice(0, 64).map(item => CODEC_NAME[item.codecid] || item.codecid))].slice(0, 16);
       const nonAv1 = all.filter(item => item.codecid !== AV1);
       if (!nonAv1.length) return payload;
 
@@ -855,6 +926,14 @@
     try { clone = response.clone(); } catch (e) { return; }
     if (!clone.body) return;
     const reader = clone.body.getReader();
+    const observer = { cancel: () => reader.cancel('bili-boost media changed').catch(() => { }) };
+    cdnState.fetchObservers.add(observer);
+    // 即使浏览器异常地长期不结束流，也不给观测器集合无界增长的机会。
+    if (cdnState.fetchObservers.size > 32) {
+      const oldest = cdnState.fetchObservers.values().next().value;
+      oldest.cancel();
+      cdnState.fetchObservers.delete(oldest);
+    }
     let got = 0;
     let firstAt = null;
     let firstChunkBytes = 0;
@@ -879,6 +958,7 @@
       finally {
         finished = true;
         clearTimeout(timer);
+        cdnState.fetchObservers.delete(observer);
         recordRealTransfer(request, got, started, firstAt, firstChunkBytes, performance.now(), 'fetch');
       }
     })();
@@ -892,13 +972,16 @@
     }
     const playerData = isVideoPage() && isPlayurl(rawUrl);
     const playurl = codecActive() && playerData;
-    if (playerData) suppressStallChecks(STALL_LOAD_GRACE);
+    if (playerData) {
+      notePlayRequest(rawUrl);
+      suppressStallChecks(STALL_LOAD_GRACE);
+    }
     const out = typeof rawUrl === 'string' || rawUrl instanceof URL ? rewriteSegmentUrl(rawUrl) : rawUrl;
     this[XHR_PLAYURL] = playurl;
     this[XHR_CDN] = null;
     try {
-      const url = new URL(out, location.href);
-      if (isMedia(url)) this[XHR_CDN] = {
+      const url = looksLikeMediaRaw(out) ? new URL(out, location.href) : null;
+      if (url && isMedia(url)) this[XHR_CDN] = {
         host: url.hostname, url, key: keyOf(url), generation: mediaGeneration,
       };
     } catch (e) { }
@@ -968,7 +1051,10 @@
   window.fetch = async function (input, init) {
     const originalUrl = typeof input === 'string' || input instanceof URL ? String(input) : (input && input.url) || '';
     const playerData = isVideoPage() && isPlayurl(originalUrl);
-    if (playerData) suppressStallChecks(STALL_LOAD_GRACE);
+    if (playerData) {
+      notePlayRequest(originalUrl);
+      suppressStallChecks(STALL_LOAD_GRACE);
+    }
     if (typeof input === 'string' || input instanceof URL) {
       input = rewriteSegmentUrl(input);
     } else if (input instanceof Request) {
@@ -977,9 +1063,10 @@
     }
     let cdnRequest = null;
     try {
-      const requestUrl = new URL(typeof input === 'string' || input instanceof URL ? String(input) : input.url, location.href);
+      const rawRequestUrl = typeof input === 'string' || input instanceof URL ? String(input) : input.url;
+      const requestUrl = looksLikeMediaRaw(rawRequestUrl) ? new URL(rawRequestUrl, location.href) : null;
       const method = String(init?.method || (input instanceof Request ? input.method : 'GET')).toUpperCase();
-      if (method === 'GET' && isMedia(requestUrl)) cdnRequest = {
+      if (requestUrl && method === 'GET' && isMedia(requestUrl)) cdnRequest = {
         host: requestUrl.hostname, url: requestUrl, key: keyOf(requestUrl), generation: mediaGeneration,
       };
     } catch (e) { }
@@ -1363,6 +1450,21 @@
       return value == null ? '—' : value + ' ms（当前源分片中位数）';
     },
     get 分片明细() { return cdnState.perf.slice(); },
+    get 诊断状态() {
+      return {
+        generation: mediaGeneration,
+        rejected: cdnState.rejected.size,
+        picked: cdnState.picked.size,
+        manual: cdnState.manual.size,
+        probing: cdnState.probing.size,
+        perf: cdnState.perf.length,
+        blacklist: cdnState.blacklist.size,
+        probeControllers: cdnState.activeProbeControllers.size,
+        fetchObservers: cdnState.fetchObservers.size,
+        health: Object.keys(health).length,
+        warningTimers: cdnState.warningTimer ? 1 : 0,
+      };
+    },
     get 测速结果() { return cdnState.lastResults; },
     get 卡顿次数() { return cdnState.stalls; },
     get 黑名单() { return [...cdnState.blacklist]; },

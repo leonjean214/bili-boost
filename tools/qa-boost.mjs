@@ -314,6 +314,35 @@ function responseOrder(response) {
   return (response?.order || []).map(item => `${names[item.codecid] || item.codecid}/${item.id}`);
 }
 
+function segmentClassifierBenchmark() {
+  const urls = Array.from({ length: 20_000 }, (_, index) => index % 10
+    ? `https://api.bilibili.com/x/player/wbi/playurl?cid=${index}&qn=32`
+    : `https://upos-sz-mirror08c.bilivideo.com/video/${index}/seg-${index}.m4s?deadline=1`);
+  const oldClassifier = raw => {
+    const url = new URL(raw);
+    return /(^|\.)((upos-[a-z0-9-]+\.bilivideo\.com)|(upos-[a-z0-9-]+\.akamaized\.net))$/.test(url.hostname) &&
+      /\.(m4s|mp4|flv)$/.test(url.pathname);
+  };
+  const fastClassifier = raw => {
+    const end = raw.indexOf('?') < 0 ? raw.length : raw.indexOf('?');
+    const tail = raw.slice(Math.max(0, end - 5), end).toLowerCase();
+    if (!tail.endsWith('.m4s') && !tail.endsWith('.mp4') && !tail.endsWith('.flv')) return false;
+    const url = new URL(raw);
+    return url.hostname.startsWith('upos-') &&
+      (url.hostname.endsWith('.bilivideo.com') || url.hostname.endsWith('.akamaized.net'));
+  };
+  const run = classifier => {
+    let count = 0;
+    const started = performance.now();
+    for (let round = 0; round < 10; round++) for (const url of urls) count += Number(classifier(url));
+    return { ms: performance.now() - started, count };
+  };
+  run(oldClassifier); run(fastClassifier);
+  const old = run(oldClassifier);
+  const fast = run(fastClassifier);
+  return { old, fast, ratio: old.ms / fast.ms };
+}
+
 const MOCK_PLAYURL = {
   code: 0,
   data: {
@@ -458,6 +487,13 @@ async function main() {
   console.log(`多 P: ${targets.multi ? `${targets.multi.bvid} (${targets.multi.pages} P)` : '未发现'}`);
   console.log(`番剧: ${targets.bangumi || '未发现'}`);
 
+  const benchmark = segmentClassifierBenchmark();
+  const benchmarkPass = benchmark.old.count === benchmark.fast.count && benchmark.old.count === 20_000;
+  addResult('分片热路径微基准', benchmarkPass ? 'PASS' : 'FAIL', {
+    codec: `${benchmark.old.ms.toFixed(1)}ms → ${benchmark.fast.ms.toFixed(1)}ms`,
+    reason: `${benchmark.ratio.toFixed(2)}x；20 万次混合请求分类（90% 非分片），计数=${benchmark.fast.count}`,
+  });
+
   const ugcUrl = `https://www.bilibili.com/video/${targets.bvid}`;
   await runScenario('对照组（不注入）', async cdp => {
     await navigate(cdp, ugcUrl);
@@ -494,6 +530,40 @@ async function main() {
     addResult('编码三态向后兼容', pass ? 'PASS' : 'FAIL', {
       reason: pass ? '旧 bhw_codec=true/false 语义不变；auto+null 仍保守剔除 AV1' :
         JSON.stringify({ forcedOn, forcedOff, automatic }),
+    });
+  });
+
+  await runScenario('健康档案旧数据迁移与双上限', async cdp => {
+    await navigate(cdp, 'https://www.bilibili.com/robots.txt');
+    await cdp.eval(String.raw`(() => {
+      const now = Date.now();
+      const legacy = {};
+      for (let i = 0; i < 40; i++) legacy['upos-test-' + i + '.bilivideo.com'] = {
+        attempts: 100, successes: 80, kbps: 100 + i, ttfb: i, at: now - i * 1000
+      };
+      for (let i = 0; i < 5; i++) legacy['upos-expired-' + i + '.bilivideo.com'] = {
+        attempts: 2, successes: 2, kbps: 999, at: now - 8 * 24 * 3600_000
+      };
+      localStorage.setItem('bhw_health', JSON.stringify(legacy));
+    })()`);
+    await navigate(cdp, 'https://www.bilibili.com/robots.txt?qa_health_migration=1');
+    const audit = await cdp.eval(String.raw`(() => {
+      const now = Date.now();
+      const stored = JSON.parse(localStorage.getItem('bhw_health'));
+      const hosts = Object.entries(stored.hosts || {});
+      return {
+        version: stored.version,
+        count: hosts.length,
+        expired: hosts.some(([host]) => host.includes('expired')),
+        attemptsCapped: hosts.every(([, value]) => value.attempts <= 24),
+        oldestAge: Math.max(...hosts.map(([, value]) => now - value.at)),
+        apiCount: Object.keys(window.__biliBoost?.主机健康 || {}).length,
+      };
+    })()`);
+    const pass = audit.version === 2 && audit.count === 32 && audit.apiCount === 32 &&
+      !audit.expired && audit.attemptsCapped && audit.oldestAge < 7 * 24 * 3600_000;
+    addResult('健康档案旧数据迁移与双上限', pass ? 'PASS' : 'FAIL', {
+      reason: pass ? 'v1 字典自动迁移为 v2 envelope；按 32 条、7 天裁剪并衰减旧样本' : JSON.stringify(audit),
     });
   });
 
@@ -655,6 +725,56 @@ async function main() {
       off();
       try { await cdp.send('Fetch.disable'); } catch {}
     }
+  });
+
+  await runScenario('长时播放与媒体切换有界', async cdp => {
+    await navigate(cdp, ugcUrl);
+    await waitFor(() => cdp.eval('window.__biliBoost?.诊断状态 || null'), {
+      timeout: 10_000,
+      label: 'diagnostic state',
+    });
+    const audit = await cdp.eval(String.raw`(async () => {
+      const host = 'upos-sz-mirror08c.bilivideo.com';
+      const openOnly = url => {
+        const xhr = new XMLHttpRequest();
+        xhr.open('GET', url);
+      };
+      for (let i = 0; i < 2000; i++) {
+        openOnly('https://' + host + '/qa/long-play/segment-' + i + '.m4s?token=qa');
+      }
+      const afterSegments = window.__biliBoost.诊断状态;
+      window.__biliBoost.手动选源(host);
+      const beforeSwitch = window.__biliBoost.诊断状态;
+      for (let i = 1; i <= 20; i++) {
+        history.pushState({}, '', '/video/BV1QATEST?p=' + i);
+        dispatchEvent(new PopStateEvent('popstate'));
+        openOnly('https://' + host + '/qa/spa-' + i + '/segment.m4s');
+      }
+      const afterSpa = window.__biliBoost.诊断状态;
+
+      // 同 URL 内的 playurl 参数变化确定性模拟“切清晰度”；cid 变化模拟“切分 P”。
+      openOnly('https://api.bilibili.com/x/player/playurl?bvid=BV1QATEST&cid=100&qn=32&fnval=16');
+      const beforeQuality = window.__biliBoost.诊断状态;
+      openOnly('https://api.bilibili.com/x/player/playurl?bvid=BV1QATEST&cid=100&qn=64&fnval=16');
+      const afterQuality = window.__biliBoost.诊断状态;
+      openOnly('https://api.bilibili.com/x/player/playurl?bvid=BV1QATEST&cid=101&qn=64&fnval=16');
+      const afterPart = window.__biliBoost.诊断状态;
+      await new Promise(resolve => setTimeout(resolve, 100));
+      return { afterSegments, beforeSwitch, afterSpa, beforeQuality, afterQuality, afterPart,
+        settled: window.__biliBoost.诊断状态 };
+    })()`, true);
+    const bounded = Object.values(audit).every(state =>
+      state.rejected <= 1 && state.picked <= 1 && state.manual <= 1 && state.probing <= 1 &&
+      state.perf <= 6 && state.blacklist <= 64 && state.probeControllers <= 6 &&
+      state.fetchObservers <= 32 && state.health <= 32 && state.warningTimers <= 1);
+    const transitionsReset = audit.afterSpa.generation >= audit.afterSegments.generation + 20 &&
+      audit.afterSpa.manual === 0 && audit.afterQuality.generation > audit.beforeQuality.generation &&
+      audit.afterPart.generation > audit.afterQuality.generation && audit.afterPart.picked === 0 &&
+      audit.afterPart.manual === 0;
+    const pass = bounded && transitionsReset;
+    addResult('长时播放与媒体切换有界', pass ? 'PASS' : 'FAIL', {
+      reason: pass ? '确定性模拟 2000 分片 + 20 次 SPA + 切清晰度/分 P；集合、数组、探测器和定时器均有界且媒体态重置' : JSON.stringify(audit),
+    });
   });
 
   await runScenario('防重复注入', async cdp => {
