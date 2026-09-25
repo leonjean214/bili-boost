@@ -10,6 +10,13 @@
 >
 > 仓库原名 `bili-cdn-switcher`，合并后改名为 `bili-boost`。GitHub 会自动重定向旧链接。
 
+### v1.5.0
+
+- 长时播放与 SPA 切视频会主动取消旧探测/观测、清理媒体态；所有动态 Map/Set/数组和待处理观测器均有硬上限。
+- 主机健康档案升级为带版本的 v2 格式，旧字典自动迁移，并同时执行 **32 台主机 + 7 天**裁剪。
+- 分 P、切清晰度会按 `cid/qn/fnval` 识别新媒体代次，旧手选、测速、实测样本和编码状态不再污染新源。
+- 分片热路径先按扩展名快筛，再构造 URL；移除每请求的 host/path 正则扫描。20 万次混合请求微基准由 **54.3ms 降至 14.5ms（3.73×）**。
+
 ---
 
 ## 毛病一：CDN 镜像不够快
@@ -112,6 +119,7 @@ B 站对同一视频同时下发 AVC / HEVC / AV1 三条流，由播放器挑。
 - 样本少于 3 次先按最好档处理（乐观探索），每轮快筛都在累积样本，很快就会落到真实分档
 - **本轮失败或超时截断的源不算成功**，也不能靠历史成功率当赢家
 - 最多保留 32 台主机、7 天过期、样本到 24 后衰减 —— 防止陈年统计支配当前网络
+- v1.5.0 起存储为带版本的 envelope；v1.3/v1.4 旧字典会在首次加载时自动迁移、裁剪，不丢失仍有效的样本
 
 **精测挂在空闲后面**。精测要下 2MB+，播放中做等于跟正片抢带宽，本身就可能造成卡顿。所以精测前先等播放器缓冲覆盖当前播放点 12 秒以上、或暂停；等不到最多等 8 秒就照跑。**快筛不等** —— 开播那一刻正是最需要选对源的时候。卡顿触发的重测也不等，那时本来就没在放。
 
@@ -275,6 +283,7 @@ __biliBoost.清空主机健康()
 | `HEALTH_RATIO_DELTA` | 0.15 | 成功率分档宽度 |
 | `HEALTH_MIN_ATTEMPTS` | 3 | 低于此样本数按最好档乐观探索 |
 | `HEALTH_MAX_HOSTS` | 32 | 健康档案保留的主机上限 |
+| `HEALTH_MAX_AGE` | 7d | 健康档案样本时间上限 |
 | `IDLE_BUFFER_SEC` | 12s | 精测要求的缓冲余量 |
 | `IDLE_MAX_WAIT` | 8s | 等不到空闲也照跑的上限 |
 | `DECODING_INFO_TIMEOUT` | 3s | 硬解能力探测超时 |
@@ -307,10 +316,13 @@ node tools/qa-boost.mjs        # 默认端口 9333，可用 BILI_BOOST_QA_PORT �
 ```
 PASS     对照组（不注入）          av01... / powerEfficient=false
 PASS     编码三态向后兼容           true / false / auto+null
+PASS     健康档案旧数据迁移与双上限  v1→v2；32 条 / 7 天裁剪
 PASS     AV1 硬解缓存过期           31 天旧值失效并写回新元数据
 PASS     普通 UGC 视频页            hvc1... / powerEfficient=true
 PASS     CDN 模块                   头部+中段、TTFB、手选/自动 API
 PASS     fetch 实测速与卡顿过滤      Response 语义不变；初始/seek/瞬时 waiting 不误判
+PASS     分片热路径微基准           54.3ms → 14.5ms（3.73×）
+PASS     长时播放与媒体切换有界      2000 分片 + 20 次 SPA + 切清晰度/分 P
 PASS     防重复注入                 四个 hook 均未再次包装
 PASS ×2  旧版冲突检测               两种注入顺序
 PASS     playurl 劫持层（mock）      fetch / XHR text / XHR json
@@ -318,12 +330,12 @@ PASS     番剧页                     avc1... / powerEfficient=true
 PASS     HUD 检查                   🟢 硬解 · HEVC/H.265
 SKIPPED  多 P 视频切 P              未登录流已内联，无 playurl 请求
 SKIPPED  切清晰度                   同上
-总计：PASS=12 FAIL=0 SKIPPED=2
+总计：PASS=15 FAIL=0 SKIPPED=2
 ```
 
 **对照组是最有价值的一条**：不注入脚本时拿到的是 `av01` 且 `powerEfficient=false`，反证了测试本身有区分度。
 
-播放器在未登录时不会发 playurl，所以编码模块的第 3/4 层用 CDP `Fetch` mock 一个含「两档清晰度 × 三种编码」的响应来确定性验证，不依赖 B 站的真实行为。
+播放器在未登录时不会发 playurl，所以编码模块的第 3/4 层用 CDP `Fetch` mock 一个含「两档清晰度 × 三种编码」的响应来确定性验证，不依赖 B 站的真实行为。多 P 与切清晰度的真实 UI 用例仍会尝试执行；未登录页面不发新请求时，另有确定性模拟验证 20 次 SPA、`cid`（分 P）及 `qn/fnval`（清晰度）变化都会重置媒体态。
 
 ---
 
@@ -362,7 +374,7 @@ SKIPPED  切清晰度                   同上
 
 ### 共同
 
-- **自动化回归是未登录跑的**，只能到 480P。登录态 **1080P 已在 Safari 手动实测通过**（HEVC 硬解、CDN 切源、`__biliCdn` 八个接口齐全）；**4K / 高码率仍未覆盖**，尤其 4K HEVC 在 M2 上的 `powerEfficient` 还没验证过。
+- **自动化回归是未登录跑的**，只能到 480P；多 P/清晰度的状态隔离已有确定性模拟，但真实 UI 流程仍可能因页面不发 playurl 而 SKIPPED。登录态 **1080P 已在 Safari 手动实测通过**（HEVC 硬解、CDN 切源、`__biliCdn` 八个接口齐全）；**4K / 高码率仍未覆盖**，尤其 4K HEVC 在 M2 上的 `powerEfficient` 还没验证过。
 - 升级期间若旧的 `bili-cdn-fix` / `bili-hwdecode` 仍启用，会造成重复劫持。脚本会检测 `bili-cdn-fix`、显示告警并隐藏它的 HUD，但不会拆除旧 hook，仍需按上面的故障排查步骤手动禁用。`bili-hwdecode` 的历史版本没有查到可靠的全局名或 HUD id，因此不做猜测性检测。
 
 ## License
