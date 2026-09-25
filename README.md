@@ -12,7 +12,7 @@
 
 ### v1.5.1
 
-- Safari 兼容审计（见 `SAFARI-AUDIT-20260925.md`）：`addSourceBuffer` 钩子改为沿原型链同时覆盖 `MediaSource` / `ManagedMediaSource`，iPhone Safari（只有 ManagedMediaSource）不再因 `MediaSource` 未定义而中断初始化；HUD 补 `-webkit-user-select`。
+- Safari 兼容审计（见 `reviews/SAFARI-AUDIT-20260925.md`）：`addSourceBuffer` 钩子改为沿原型链同时覆盖 `MediaSource` / `ManagedMediaSource`，iPhone Safari（只有 ManagedMediaSource）不再因 `MediaSource` 未定义而中断初始化；HUD 补 `-webkit-user-select`。
 
 ### v1.5.0
 
