@@ -1,34 +1,18 @@
 #!/usr/bin/env node
 
 import { execFile, execFileSync, spawn } from 'node:child_process';
-// 用户 2026-09-27：Mac 上开 Chrome 播视频太吵 → 在 macOS 上直接转交 tools/qa-on-win.sh 在 Win 台式机跑。
-// 确需在 Mac 本机跑时设 BILI_BOOST_QA_ALLOW_MAC=1。
-if (process.platform === 'darwin' && process.env.BILI_BOOST_QA_ALLOW_MAC !== '1') {
-  const { spawnSync } = await import('node:child_process');
-  console.error('[qa-boost] macOS：转到 Win 台式机运行（tools/qa-on-win.sh）；本机强制运行请设 BILI_BOOST_QA_ALLOW_MAC=1');
-  const r = spawnSync(new URL('./qa-on-win.sh', import.meta.url).pathname, [], { stdio: 'inherit' });
-  process.exit(r.status ?? 1);
-}
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-// Chrome 路径：BILI_BOOST_QA_CHROME 优先，否则按平台取默认安装位置（Win 上由 tools/qa-on-win.sh 调用）
-const CHROME = process.env.BILI_BOOST_QA_CHROME || (process.platform === 'win32'
-  ? 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe'
-  : '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome');
-// BILI_BOOST_QA_HEADLESS=1：无窗口运行（ssh 远程会话没有桌面时用）
-const HEADLESS = process.env.BILI_BOOST_QA_HEADLESS === '1';
+const CHROME = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 const PORT = Number(process.env.BILI_BOOST_QA_PORT || 9333);
 const ROOT = new URL('../', import.meta.url);
 const ROOT_PATH = fileURLToPath(ROOT);
 const USER_SCRIPT = await readFile(new URL('../bili-boost.user.js', import.meta.url), 'utf8');
 let LEGACY_CDN_SCRIPT = null;
-// 远程机器没有 git 时（Win），由 tools/qa-on-win.sh 预先取出旧脚本并用环境变量传路径
-if (process.env.BILI_BOOST_QA_LEGACY) {
-  try { LEGACY_CDN_SCRIPT = await readFile(process.env.BILI_BOOST_QA_LEGACY, 'utf8'); } catch {}
-} else try {
+try {
   LEGACY_CDN_SCRIPT = execFileSync('git', ['show', 'bb6d614:bili-cdn-fix.user.js'], {
     cwd: ROOT_PATH,
     encoding: 'utf8',
@@ -552,8 +536,6 @@ async function main() {
     '--no-first-run',
     '--no-default-browser-check',
     '--autoplay-policy=no-user-gesture-required',
-    '--mute-audio',                       // 会真实播放 B 站视频：一律静音（用户 2026-09-27 反映 Mac 上太吵）
-    ...(HEADLESS ? ['--headless=new'] : []),
     '--window-position=2000,2000',
     '--window-size=600,400',
     'about:blank',
@@ -1273,19 +1255,11 @@ async function cleanup() {
   // Match only this run's random profile so a late-starting test browser cannot leak.
   if (profile) {
     const match = `--user-data-dir=${profile}`;
-    if (process.platform === 'win32') {
-      const ps = `Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*${profile.replace(/'/g, "''")}*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }`;
-      await new Promise(resolve => execFile('powershell', ['-NoProfile', '-Command', ps], () => resolve()));
-      await sleep(500);
-    } else {
-      await new Promise(resolve => execFile('/usr/bin/pkill', ['-TERM', '-f', match], () => resolve()));
-      await sleep(300);
-      await new Promise(resolve => execFile('/usr/bin/pkill', ['-KILL', '-f', match], () => resolve()));
-    }
+    await new Promise(resolve => execFile('/usr/bin/pkill', ['-TERM', '-f', match], () => resolve()));
+    await sleep(300);
+    await new Promise(resolve => execFile('/usr/bin/pkill', ['-KILL', '-f', match], () => resolve()));
   }
-  if (profile) {
-    try { await rm(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 400 }); } catch {}   // Win 上 Chrome 刚退出时文件可能仍被占用
-  }
+  if (profile) await rm(profile, { recursive: true, force: true });
 }
 
 process.once('SIGINT', async () => { await cleanup(); process.exit(130); });
