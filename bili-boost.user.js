@@ -143,6 +143,9 @@
       }
     }
     r.at = Date.now();
+    // 内存态本身也是公开诊断与后续排序的事实源，不能等整轮测速 finally 落盘时才裁剪。
+    // 新 host 记录完成后立即按最近更新时间维持 32 条上限，避免测速进行中短暂暴露第 33 条。
+    health = normalizeHealth(health);
     healthDirty = true;
   }
   function ratioOf(host) {
