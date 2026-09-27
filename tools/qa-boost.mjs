@@ -410,6 +410,22 @@ async function discover() {
         return { bvid, pages: Array.isArray(json.data) ? json.data.length : 0 };
       } catch (error) { return { bvid, pages: 0, error: String(error) }; }
     }))`, true);
+
+    // 首页会混入未开播、付费或充电专属卡片。优先实播多 P 候选；同一个
+    // SourceBuffer 观测同时证明该视频适合通用回归，避免一个坏目标连带制造多项假失败。
+    const ordered = [...pages.filter(item => item.pages > 1), ...pages.filter(item => item.pages <= 1)];
+    let playable = null;
+    let multi = null;
+    for (const candidate of ordered) {
+      await navigate(cdp, `https://www.bilibili.com/video/${candidate.bvid}`);
+      try {
+        await waitForCodec(cdp, 15_000);
+        playable ||= candidate;
+        if (candidate.pages > 1) multi ||= candidate;
+        if (playable && (multi || candidate.pages <= 1)) break;
+      } catch {}
+    }
+    if (!playable) throw new Error(`首页发现 ${found.videos.length} 个 BV，但没有候选在 15 秒内创建视频 SourceBuffer`);
     let bangumi = found.bangumi;
     if (!bangumi) {
       await navigate(cdp, 'https://www.bilibili.com/anime/');
@@ -424,9 +440,9 @@ async function discover() {
     // unset control state before any player page can inherit a codec preference.
     await cdp.eval("localStorage.removeItem('bilibili_player_codec_prefer_type')");
     return {
-      bvid: found.videos[0],
-      candidates: found.videos,
-      multi: pages.find(item => item.pages > 1) || null,
+      bvid: playable.bvid,
+      candidates: pages.map(item => item.bvid),
+      multi,
       bangumi,
     };
   } finally {
@@ -835,6 +851,64 @@ async function main() {
         : JSON.stringify(probed),
     });
   }, { prelude: IPHONE_MSE_SHAPE });
+
+  // macOS Safari 17+ 同时暴露两个构造器，但 addSourceBuffer 由共同的 MediaSource
+  // 原型提供。两条查找路径必须落到同一个 owner prototype，不能重复包装副作用。
+  const DUAL_MSE_SHAPE = String.raw`
+    (() => {
+      const RealMediaSource = window.MediaSource;
+      const sentinel = {};
+      const state = window.__qaDualMse = {
+        baseCalls: 0,
+        hookMicrotasks: 0,
+        sentinel,
+      };
+      const nativeQueueMicrotask = window.queueMicrotask;
+      window.queueMicrotask = callback => {
+        state.hookMicrotasks += 1;
+        return nativeQueueMicrotask.call(window, callback);
+      };
+      RealMediaSource.prototype.addSourceBuffer = function() {
+        state.baseCalls += 1;
+        return sentinel;
+      };
+      state.baseAddSourceBuffer = RealMediaSource.prototype.addSourceBuffer;
+      window.ManagedMediaSource = class ManagedMediaSource extends RealMediaSource {};
+    })();
+  `;
+  await runScenario('Safari：MediaSource / ManagedMediaSource 双全局', async cdp => {
+    await navigate(cdp, ugcUrl);
+    const probed = await waitFor(() => cdp.eval(String.raw`(() => {
+      const api = window.__biliBoost;
+      const state = window.__qaDualMse;
+      if (!api || !state || typeof window.ManagedMediaSource !== 'function') return null;
+      const shared = MediaSource.prototype;
+      const managedBase = Object.getPrototypeOf(ManagedMediaSource.prototype);
+      const wrapped = shared.addSourceBuffer;
+      state.baseCalls = 0;
+      state.hookMicrotasks = 0;
+      const mime = 'video/mp4; codecs="hvc1.1.6.L120.90"';
+      const mediaResult = new MediaSource().addSourceBuffer(mime);
+      const managedResult = new ManagedMediaSource().addSourceBuffer(mime);
+      return {
+        sharedOwner: managedBase === shared,
+        inheritedMethod: ManagedMediaSource.prototype.addSourceBuffer === wrapped,
+        ownOnManaged: Object.prototype.hasOwnProperty.call(ManagedMediaSource.prototype, 'addSourceBuffer'),
+        hooked: wrapped !== state.baseAddSourceBuffer,
+        baseCalls: state.baseCalls,
+        hookMicrotasks: state.hookMicrotasks,
+        returnPreserved: mediaResult === state.sentinel && managedResult === state.sentinel,
+        picked: api.当前编码,
+        mime,
+      };
+    })()`), { timeout: 10_000, label: 'MediaSource / ManagedMediaSource shared prototype init' });
+    const pass = probed.sharedOwner && probed.inheritedMethod && !probed.ownOnManaged && probed.hooked &&
+      probed.baseCalls === 2 && probed.hookMicrotasks === 2 && probed.returnPreserved && probed.picked === probed.mime;
+    addResult('Safari：MediaSource / ManagedMediaSource 双全局', pass ? 'PASS' : 'FAIL', {
+      reason: pass ? '两个构造器共享同一 owner prototype；各调用一次时底层调用和编码副作用均恰好两次，返回值原样透传'
+        : JSON.stringify(probed),
+    });
+  }, { prelude: DUAL_MSE_SHAPE });
 
   for (const [legacyOrder, orderLabel] of [['before', '旧版先注入'], ['after', '旧版后注入']]) {
     const name = `旧版冲突检测（${orderLabel}）`;
