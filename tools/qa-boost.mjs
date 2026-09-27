@@ -214,7 +214,7 @@ async function endpoint(path, options) {
   return fetch(`http://127.0.0.1:${PORT}${path}`, options);
 }
 
-async function newPage({ inject = false, injectTwice = false, legacyOrder = null } = {}) {
+async function newPage({ inject = false, injectTwice = false, legacyOrder = null, prelude = '' } = {}) {
   const target = await (await endpoint('/json/new?about%3Ablank', { method: 'PUT' })).json();
   const cdp = await CDP.connect(target.webSocketDebuggerUrl);
   await Promise.all([cdp.send('Page.enable'), cdp.send('Runtime.enable')]);
@@ -235,6 +235,8 @@ async function newPage({ inject = false, injectTwice = false, legacyOrder = null
     };
   `;
   const parts = [OBSERVER];
+  // prelude 在观测器之后、用户脚本之前执行，用于模拟其他浏览器的 API 形态。
+  if (prelude) parts.push(prelude);
   if (inject) {
     if (legacyOrder === 'before' && LEGACY_CDN_SCRIPT) parts.push(LEGACY_CDN_SCRIPT);
     parts.push(USER_SCRIPT);
@@ -369,10 +371,10 @@ function addResult(name, status, details = {}) {
   results.push({ name, status, codec: details.codec || '—', reason: details.reason || '', powerEfficient: details.powerEfficient });
 }
 
-async function runScenario(name, fn, { inject = name !== '对照组（不注入）', injectTwice = false, legacyOrder = null } = {}) {
+async function runScenario(name, fn, { inject = name !== '对照组（不注入）', injectTwice = false, legacyOrder = null, prelude = '' } = {}) {
   let page;
   try {
-    page = await newPage({ inject, injectTwice, legacyOrder });
+    page = await newPage({ inject, injectTwice, legacyOrder, prelude });
     await fn(page.cdp);
   } catch (error) {
     addResult(name, 'FAIL', { reason: error.message });
@@ -795,6 +797,44 @@ async function main() {
       reason: pass ? '重复执行后 HUD 仍为一个，fetch/open/send/addSourceBuffer 均未再次包装' : JSON.stringify(checked),
     });
   }, { injectTwice: true });
+
+  // iPhone Safari 只暴露 ManagedMediaSource（继承 MediaSource），全局没有 MediaSource。
+  // 在 Chrome 里按 WebKit IDL 的继承关系造出同形环境：脚本必须完整初始化，
+  // 并且经 ManagedMediaSource 调 addSourceBuffer 时仍能记录编码。
+  const IPHONE_MSE_SHAPE = String.raw`
+    (() => {
+      const RealMediaSource = window.MediaSource;
+      window.ManagedMediaSource = class ManagedMediaSource extends RealMediaSource {};
+      window.__qaBaseAddSourceBuffer = RealMediaSource.prototype.addSourceBuffer;
+      delete window.MediaSource;
+    })();
+  `;
+  await runScenario('Safari：仅 ManagedMediaSource', async cdp => {
+    await navigate(cdp, ugcUrl);
+    const probed = await waitFor(() => cdp.eval(String.raw`(() => {
+      const api = window.__biliBoost;
+      if (!api || typeof window.ManagedMediaSource !== 'function') return null;
+      const mime = 'video/mp4; codecs="hvc1.1.6.L120.90"';
+      const base = Object.getPrototypeOf(ManagedMediaSource.prototype);
+      let threw = null;
+      try { new ManagedMediaSource().addSourceBuffer(mime); } catch (error) { threw = error.name; }
+      return {
+        mediaSourceGlobal: typeof window.MediaSource,
+        hooked: base.addSourceBuffer !== window.__qaBaseAddSourceBuffer,
+        ownOnManaged: Object.prototype.hasOwnProperty.call(ManagedMediaSource.prototype, 'addSourceBuffer'),
+        picked: api.当前编码,
+        mime,
+        threw,
+        hasRetest: typeof api.重测 === 'function'
+      };
+    })()`), { timeout: 10_000, label: 'ManagedMediaSource-only init' });
+    const pass = probed.mediaSourceGlobal === 'undefined' && probed.hooked && !probed.ownOnManaged &&
+      probed.picked === probed.mime && probed.hasRetest;
+    addResult('Safari：仅 ManagedMediaSource', pass ? 'PASS' : 'FAIL', {
+      reason: pass ? '无 MediaSource 全局时完整初始化；经 ManagedMediaSource 调用仍记录编码（基类原型只包一次）'
+        : JSON.stringify(probed),
+    });
+  }, { prelude: IPHONE_MSE_SHAPE });
 
   for (const [legacyOrder, orderLabel] of [['before', '旧版先注入'], ['after', '旧版后注入']]) {
     const name = `旧版冲突检测（${orderLabel}）`;

@@ -7,3 +7,5 @@
 !bili-boost.user.js
 !tools/
 !tools/*.mjs
+!reviews/
+!reviews/*.md
