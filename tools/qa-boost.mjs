@@ -25,6 +25,7 @@ let browserCdp;
 let profile;
 let cleaning = false;
 let chromeStderr = '';
+const qaStartedAt = Date.now();
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -63,6 +64,7 @@ class CDP {
     this.nextId = 0;
     this.pending = new Map();
     this.listeners = new Map();
+    this.closedPromise = new Promise(resolve => { this.resolveClosed = resolve; });
     ws.addEventListener('message', event => {
       const message = JSON.parse(event.data);
       if (!message.id) {
@@ -84,6 +86,7 @@ class CDP {
         reject(new Error('CDP connection closed'));
       }
       this.pending.clear();
+      this.resolveClosed();
     });
   }
 
@@ -96,9 +99,24 @@ class CDP {
   static async connect(url) {
     const ws = new WebSocket(url);
     await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error('WebSocket open timeout')), 10_000);
-      ws.addEventListener('open', () => { clearTimeout(timer); resolve(); }, { once: true });
-      ws.addEventListener('error', () => { clearTimeout(timer); reject(new Error('WebSocket connection failed')); }, { once: true });
+      const cleanup = () => {
+        clearTimeout(timer);
+        ws.removeEventListener('open', onOpen);
+        ws.removeEventListener('error', onError);
+      };
+      const onOpen = () => { cleanup(); resolve(); };
+      const onError = () => {
+        cleanup();
+        try { ws.close(); } catch {}
+        reject(new Error('WebSocket connection failed'));
+      };
+      const timer = setTimeout(() => {
+        cleanup();
+        try { ws.close(); } catch {}
+        reject(new Error('WebSocket open timeout'));
+      }, 10_000);
+      ws.addEventListener('open', onOpen);
+      ws.addEventListener('error', onError);
     });
     return new CDP(ws);
   }
@@ -131,7 +149,12 @@ class CDP {
     return response.result?.value;
   }
 
-  close() { this.ws.close(); }
+  async close(timeout = 1_000) {
+    try {
+      if (this.ws.readyState < 2) this.ws.close();
+    } catch {}
+    await Promise.race([this.closedPromise, sleep(timeout)]);
+  }
 }
 
 const OBSERVER = String.raw`
@@ -255,8 +278,8 @@ async function newPage({ inject = false, injectTwice = false, legacyOrder = null
 
 async function closePage(page) {
   if (!page) return;
-  try { page.cdp.close(); } catch {}
   try { await endpoint(`/json/close/${page.targetId}`); } catch {}
+  try { await page.cdp.close(); } catch {}
 }
 
 async function navigate(cdp, url) {
@@ -372,6 +395,27 @@ const MOCK_PLAYURL = {
 const INLINE_PLAYINFO_SKIP = '未登录只有两档清晰度，流已内联在 __playinfo__，播放器无需重新请求 playurl';
 const RESET_CODEC_PREFERENCE = String.raw`
   try { localStorage.removeItem('bilibili_player_codec_prefer_type'); } catch {}
+`;
+const FORCE_CODEC_MODULE = String.raw`
+  try {
+    localStorage.setItem('bhw_codec', JSON.stringify(true));
+    localStorage.setItem('bhw_av1hw', 'null');
+  } catch {}
+`;
+const HEALTH_BOUNDARY_SETUP = String.raw`
+  try {
+    const now = Date.now();
+    const hosts = {};
+    for (let i = 0; i < 32; i++) hosts['upos-qa-history-' + i + '.bilivideo.com'] = {
+      attempts: 1, successes: 1, kbps: 100 + i, ttfb: 10 + i, at: now - i
+    };
+    localStorage.setItem('bhw_health', JSON.stringify({ version: 2, updatedAt: now, hosts }));
+    window.__qaHealthMax = 32;
+    window.__qaHealthWatch = setInterval(() => {
+      const count = window.__biliBoost?.诊断状态?.health;
+      if (Number.isFinite(count)) window.__qaHealthMax = Math.max(window.__qaHealthMax, count);
+    }, 10);
+  } catch {}
 `;
 const FALLBACK_MULTI_BVIDS = ['BV1kqaN6NEh3', 'BV1JXbV6jEA3'];
 const FALLBACK_BANGUMI_URLS = [
@@ -536,6 +580,7 @@ async function main() {
     '--no-first-run',
     '--no-default-browser-check',
     '--autoplay-policy=no-user-gesture-required',
+    '--mute-audio',
     '--window-position=2000,2000',
     '--window-size=600,400',
     'about:blank',
@@ -696,13 +741,21 @@ async function main() {
         manualOk
       };
     })()`), { timeout: 55_000, interval: 500, label: 'CDN 两阶段多点测速结果' });
+    const healthBound = await cdp.eval(String.raw`(() => {
+      clearInterval(window.__qaHealthWatch);
+      return {
+        max: window.__qaHealthMax,
+        current: window.__biliBoost?.诊断状态?.health,
+      };
+    })()`);
+    const healthBounded = healthBound.max <= 32 && healthBound.current <= 32;
     const pass = result.alias && result.publicApi && result.resultCount > 0 &&
-      result.stallsType === 'number' && result.timingOk && result.manualOk;
+      result.stallsType === 'number' && result.timingOk && result.manualOk && healthBounded;
     addResult('CDN 模块', pass ? 'PASS' : 'FAIL', {
       codec: result.source || '未选源',
-      reason: `${pass ? '' : 'CDN 公开接口、多点计时或手动切源不完整；'}测速条目=${result.resultCount}，实测=${result.speed}`,
+      reason: `${pass ? '' : 'CDN 公开接口、多点计时、手动切源或健康上限不完整；'}测速条目=${result.resultCount}，实测=${result.speed}，healthMax=${healthBound.max}，healthNow=${healthBound.current}`,
     });
-  }, { attempts: ugcAttempts });
+  }, { attempts: ugcAttempts, beforeObserver: HEALTH_BOUNDARY_SETUP });
 
   await runScenario('fetch 实测速与卡顿过滤', async cdp => {
     await navigate(cdp, 'https://www.bilibili.com/robots.txt');
@@ -1070,7 +1123,7 @@ async function main() {
       off();
       try { await cdp.send('Fetch.disable'); } catch {}
     }
-  }, { attempts: ugcAttempts });
+  }, { attempts: ugcAttempts, beforeObserver: FORCE_CODEC_MODULE });
 
   if (!targets.bangumi.length) {
     addResult('番剧页', 'FAIL', { reason: '没有可供有界重试的番剧候选' });
@@ -1239,18 +1292,44 @@ async function main() {
   }, { attempts: ugcAttempts });
 }
 
+function waitForChildExit(child, timeout) {
+  if (!child || child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true);
+  return new Promise(resolve => {
+    let timer;
+    const done = () => {
+      clearTimeout(timer);
+      child.off('exit', done);
+      resolve(true);
+    };
+    timer = setTimeout(() => {
+      child.off('exit', done);
+      resolve(false);
+    }, timeout);
+    child.once('exit', done);
+  });
+}
+
 async function cleanup() {
   if (cleaning) return;
   cleaning = true;
   if (browserCdp) {
     try { await browserCdp.send('Browser.close', {}, 3_000); } catch {}
-    try { browserCdp.close(); } catch {}
+    try { await browserCdp.close(); } catch {}
+    browserCdp = null;
   }
-  if (chrome && chrome.exitCode === null) {
-    chrome.kill('SIGTERM');
-    await Promise.race([new Promise(resolve => chrome.once('exit', resolve)), sleep(3_000)]);
-    if (chrome.exitCode === null) chrome.kill('SIGKILL');
+  if (chrome && chrome.exitCode === null && chrome.signalCode === null) {
+    try { chrome.kill('SIGTERM'); } catch {}
+    if (!await waitForChildExit(chrome, 3_000)) {
+      try { chrome.kill('SIGKILL'); } catch {}
+      await waitForChildExit(chrome, 2_000);
+    }
   }
+  if (chrome?.stderr) {
+    chrome.stderr.removeAllListeners('data');
+    chrome.stderr.destroy();
+  }
+  if (chrome) chrome.unref();
+  chrome = null;
   // Chrome on macOS can detach a child from the launcher before CDP is ready.
   // Match only this run's random profile so a late-starting test browser cannot leak.
   if (profile) {
@@ -1258,8 +1337,9 @@ async function cleanup() {
     await new Promise(resolve => execFile('/usr/bin/pkill', ['-TERM', '-f', match], () => resolve()));
     await sleep(300);
     await new Promise(resolve => execFile('/usr/bin/pkill', ['-KILL', '-f', match], () => resolve()));
+    await rm(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+    profile = null;
   }
-  if (profile) await rm(profile, { recursive: true, force: true });
 }
 
 process.once('SIGINT', async () => { await cleanup(); process.exit(130); });
@@ -1282,4 +1362,5 @@ for (const result of results) {
 }
 const counts = Object.fromEntries(['PASS', 'FAIL', 'SKIPPED'].map(status => [status, results.filter(r => r.status === status).length]));
 console.log(`总计: PASS=${counts.PASS} FAIL=${counts.FAIL} SKIPPED=${counts.SKIPPED}`);
+console.log(`耗时: ${((Date.now() - qaStartedAt) / 1000).toFixed(1)}s`);
 if (counts.FAIL) process.exitCode = 1;
