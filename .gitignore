@@ -9,4 +9,3 @@
 !tools/*.mjs
 !reviews/
 !reviews/*.md
-!tools/*.sh
