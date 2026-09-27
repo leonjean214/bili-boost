@@ -318,30 +318,30 @@ node tools/qa-boost.mjs        # 默认端口 9333，可用 BILI_BOOST_QA_PORT �
 会起一个独立 profile 的 Chrome，跑完自动清理。当前结果（未登录，M2 / Chrome 152）：
 
 ```
-PASS     对照组（不注入）          av01... / powerEfficient=false
+PASS     对照组（不注入）          av01... / 实测 AV1 powerEfficient
 PASS     编码三态向后兼容           true / false / auto+null
 PASS     健康档案旧数据迁移与双上限  v1→v2；32 条 / 7 天裁剪
 PASS     AV1 硬解缓存过期           31 天旧值失效并写回新元数据
-PASS     普通 UGC 视频页            hvc1... / powerEfficient=true
+PASS     普通 UGC 视频页            按实测能力保留 AV1 或改选 HEVC/AVC
 PASS     CDN 模块                   头部+中段、TTFB、手选/自动 API
 PASS     fetch 实测速与卡顿过滤      Response 语义不变；初始/seek/瞬时 waiting 不误判
-PASS     分片热路径微基准           54.3ms → 14.5ms（3.73×）
-PASS     长时播放与媒体切换有界      2000 分片 + 20 次 SPA + 切清晰度/分 P
+PASS     分片热路径微基准           20 万次分类计数一致
+PASS ×2  长时播放与媒体切换有界      有/无 AV1 硬解；2000 分片 + 20 次 SPA
 PASS     防重复注入                 四个 hook 均未再次包装
 PASS     Safari 仅 ManagedMediaSource  iPhone API 形态可完整初始化
 PASS     Safari 双全局共享原型去重     两个构造器共用的 hook 只包装一次
 PASS ×2  旧版冲突检测               两种注入顺序
-PASS     playurl 劫持层（mock）      fetch / XHR text / XHR json
+PASS ×2  playurl 劫持层（mock）      有硬解保留 AV1；无硬解三通道清除 AV1
 PASS     番剧页                     avc1... / powerEfficient=true
-PASS     HUD 检查                   🟢 硬解 · HEVC/H.265
+PASS     HUD 检查                   实测能力、编码和 auto 策略一致
 SKIPPED  多 P 视频切 P              未登录流已内联，无 playurl 请求
 SKIPPED  切清晰度                   同上
-总计：PASS=17 FAIL=0 SKIPPED=2
+总计：PASS=19 FAIL=0 SKIPPED=2
 ```
 
-**对照组是最有价值的一条**：不注入脚本时拿到的是 `av01` 且 `powerEfficient=false`，反证了测试本身有区分度。测试器在每个候选文档的 Observer 运行前清除编码偏好，只有“干净对照选择 AV1、注入后选择 HEVC/AVC”的视频才进入场景池；后续外部 UGC/番剧场景遇到导航、网络或 CDP 瞬态错误时，会换全新页面和下一个已验证候选，最多三次，不放宽业务断言。
+**对照组是最有价值的一条**：不注入脚本时必须拿到 `av01`，并以 `powerEfficient` 的实际结果冻结本机能力分支。测试器在每个候选文档的 Observer 运行前清除编码偏好；只有“干净对照选择 AV1、注入后按实测能力保留 AV1 或改选 HEVC/AVC”的视频才进入场景池。后续外部 UGC/番剧场景遇到导航、网络或 CDP 瞬态错误时，会换全新页面和下一个已验证候选，最多三次，不放宽业务断言。
 
-播放器在未登录时不会发 playurl，所以编码模块的第 3/4 层用 CDP `Fetch` mock 一个含「两档清晰度 × 三种编码」的响应来确定性验证，不依赖 B 站的真实行为。多 P 与切清晰度的真实 UI 用例仍会尝试执行；未登录页面不发新请求或有界发现未找到可播放多 P 时会如实 SKIPPED，另有确定性模拟验证 20 次 SPA、`cid`（分 P）及 `qn/fnval`（清晰度）变化都会重置媒体态。
+播放器在未登录时不会发 playurl，所以编码模块的第 3/4 层用 CDP `Fetch` mock 一个含「两档清晰度 × 三种编码」的响应来确定性验证，不依赖 B 站的真实行为。mock 与长时资源用例都分别模拟“有 AV1 硬解”和“无 AV1 硬解”：前者验证 `auto` 原样保留 AV1，后者验证 fetch、XHR text、XHR json 与 `support_formats` 均清除 AV1；资源上限和 `cid/qn/fnval` 状态隔离在两个分支都执行。多 P 与切清晰度的真实 UI 用例仍会尝试执行；未登录页面不发新请求或有界发现未找到可播放多 P 时会如实 SKIPPED。
 
 ---
 

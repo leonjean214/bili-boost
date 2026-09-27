@@ -412,12 +412,39 @@ const INLINE_PLAYINFO_SKIP = '未登录只有两档清晰度，流已内联在 _
 const RESET_CODEC_PREFERENCE = String.raw`
   try { localStorage.removeItem('bilibili_player_codec_prefer_type'); } catch {}
 `;
-const FORCE_CODEC_MODULE = String.raw`
+const RESET_CODEC_AUTO = String.raw`
   try {
-    localStorage.setItem('bhw_codec', JSON.stringify(true));
+    localStorage.setItem('bhw_codec', JSON.stringify('auto'));
     localStorage.setItem('bhw_av1hw', 'null');
+    localStorage.removeItem('bilibili_player_codec_prefer_type');
   } catch {}
 `;
+function codecAutoCacheSetup(av1Hardware) {
+  return String.raw`
+    try {
+      const env = [navigator.userAgent || '', navigator.platform || '', navigator.hardwareConcurrency || ''].join('|');
+      localStorage.setItem('bhw_codec', JSON.stringify('auto'));
+      localStorage.setItem('bhw_av1hw', JSON.stringify({ value: ${Boolean(av1Hardware)}, at: Date.now(), env }));
+      localStorage.removeItem('bilibili_player_codec_prefer_type');
+    } catch {}
+  `;
+}
+function codecProbePrelude(av1Hardware) {
+  return String.raw`
+    (() => {
+      const original = navigator.mediaCapabilities.decodingInfo.bind(navigator.mediaCapabilities);
+      Object.defineProperty(navigator.mediaCapabilities, 'decodingInfo', {
+        configurable: true,
+        value(config) {
+          if (/av01/i.test(config?.video?.contentType || '')) {
+            return Promise.resolve({ supported: true, smooth: true, powerEfficient: ${Boolean(av1Hardware)} });
+          }
+          return original(config);
+        }
+      });
+    })();
+  `;
+}
 const HEALTH_BOUNDARY_SETUP = String.raw`
   try {
     const now = Date.now();
@@ -481,14 +508,17 @@ async function probeUgcCandidate(candidate) {
     const controlCodec = await waitForCodec(controlPage.cdp, 15_000);
     const initialPreference = await controlPage.cdp.eval('window.__qaBoost?.initialCodecPreference ?? null');
     if (initialPreference !== null || codecKind(controlCodec) !== 'AV1') return null;
+    const av1Hardware = await powerEfficient(controlPage.cdp, controlCodec);
+    if (typeof av1Hardware !== 'boolean') return null;
     await closePage(controlPage);
     controlPage = null;
 
-    injectedPage = await newPage({ inject: true });
+    injectedPage = await newPage({ inject: true, beforeObserver: codecAutoCacheSetup(av1Hardware) });
     await navigate(injectedPage.cdp, url);
     const injectedCodec = await waitForCodec(injectedPage.cdp, 15_000);
-    if (!['HEVC', 'AVC'].includes(codecKind(injectedCodec))) return null;
-    return { ...candidate, controlCodec, injectedCodec };
+    const injectedKind = codecKind(injectedCodec);
+    if (av1Hardware ? injectedKind !== 'AV1' : !['HEVC', 'AVC'].includes(injectedKind)) return null;
+    return { ...candidate, controlCodec, injectedCodec, av1Hardware };
   } catch {
     return null;
   } finally {
@@ -527,8 +557,8 @@ async function discoverOnce() {
     }))`, true);
 
     // 首页会混入未开播、付费或充电专属卡片；共享 profile 还可能被播放器写入编码偏好。
-    // 每个候选都在独立 target 的 document-start、Observer 之前清理偏好，并且只有实际
-    // 创建 AV1 SourceBuffer 的干净对照才可进入后续场景。优先多 P，最多验证 12 个候选。
+    // 每个候选都在独立 target 的 document-start、Observer 之前清理偏好；干净对照必须
+    // 创建 AV1 SourceBuffer，注入页则按实测硬解能力保留 AV1 或改选 HEVC/AVC。优先多 P，最多验证 12 个候选。
     const ordered = [...pages.filter(item => item.pages > 1), ...pages.filter(item => item.pages <= 1)];
     const playable = [];
     for (const candidate of ordered.slice(0, 12)) {
@@ -537,14 +567,17 @@ async function discoverOnce() {
       if (playable.length >= MAX_LIVE_ATTEMPTS && playable.some(item => item.pages > 1)) break;
     }
     if (!playable.length) {
-      throw new Error(`有界验证了 ${Math.min(ordered.length, 12)} 个 BV，但没有干净对照在 15 秒内选择 AV1 SourceBuffer`);
+      throw new Error(`有界验证了 ${Math.min(ordered.length, 12)} 个 BV，但没有候选同时满足干净 AV1 对照和能力分支断言`);
     }
+    const capabilities = new Set(playable.map(item => item.av1Hardware));
+    if (capabilities.size !== 1) throw new Error(`候选 AV1 硬解探测结果不一致：${[...capabilities].join(', ')}`);
     const bangumi = [...new Set([found.bangumi, ...FALLBACK_BANGUMI_URLS].filter(Boolean))];
     return {
       ugc: playable.slice(0, MAX_LIVE_ATTEMPTS),
       candidates: pages.map(item => item.bvid),
       multi: playable.filter(item => item.pages > 1).slice(0, MAX_LIVE_ATTEMPTS),
       bangumi: bangumi.slice(0, MAX_LIVE_ATTEMPTS),
+      av1Hardware: playable[0].av1Hardware,
     };
   } finally {
     await closePage(page);
@@ -570,7 +603,7 @@ async function classifyNoPlayback(cdp, context) {
   return `${context}未观测到视频 SourceBuffer；${loginLimited ? '页面显示登录/会员/版权限制' : `页面：${seen.title || seen.url}`}`;
 }
 
-async function testSimple(name, urls, expected, inject = true) {
+async function testSimple(name, urls, expected, { inject = true, beforeObserver = '' } = {}) {
   const candidates = Array.isArray(urls) ? urls : [urls];
   await runScenario(name, async (cdp, attempt) => {
     await navigate(cdp, candidates[attempt % candidates.length]);
@@ -585,7 +618,7 @@ async function testSimple(name, urls, expected, inject = true) {
       powerEfficient: efficient,
       reason: pass ? '' : `期望 ${expected.join('/')}，实际 ${kind}`,
     });
-  }, { inject, attempts: Math.min(MAX_LIVE_ATTEMPTS, candidates.length) });
+  }, { inject, beforeObserver, attempts: Math.min(MAX_LIVE_ATTEMPTS, candidates.length) });
 }
 
 async function main() {
@@ -621,6 +654,7 @@ async function main() {
   console.log(`UGC: ${targets.ugc.map(item => item.bvid).join(', ')}`);
   console.log(`多 P: ${targets.multi.length ? targets.multi.map(item => `${item.bvid} (${item.pages} P)`).join(', ') : '未发现'}`);
   console.log(`番剧候选: ${targets.bangumi.join(', ')}`);
+  console.log(`AV1 硬解实测: ${targets.av1Hardware ? '有' : '无'}（后续 live 断言按此分支）`);
 
   const benchmark = segmentClassifierBenchmark();
   const benchmarkPass = benchmark.old.count === benchmark.fast.count && benchmark.old.count === 20_000;
@@ -632,6 +666,8 @@ async function main() {
   const ugcUrls = targets.ugc.map(item => `https://www.bilibili.com/video/${item.bvid}`);
   const ugcAttempts = Math.min(MAX_LIVE_ATTEMPTS, ugcUrls.length);
   const ugcUrlFor = attempt => ugcUrls[attempt % ugcUrls.length];
+  const actualCodecSetup = codecAutoCacheSetup(targets.av1Hardware);
+  const expectedLiveCodecs = targets.av1Hardware ? ['AV1'] : ['HEVC', 'AVC'];
   await runScenario('对照组（不注入）', async (cdp, attempt) => {
     await navigate(cdp, ugcUrlFor(attempt));
     let codec;
@@ -640,11 +676,13 @@ async function main() {
     const efficient = await powerEfficient(cdp, codec);
     const initialPreference = await cdp.eval('window.__qaBoost?.initialCodecPreference ?? null');
     const cleanControl = initialPreference === null;
-    const pass = cleanControl && codecKind(codec) === 'AV1';
+    const pass = cleanControl && codecKind(codec) === 'AV1' && efficient === targets.av1Hardware;
     if (!pass) {
-      throw new Error(`候选不再满足干净 AV1 对照：初始值=${JSON.stringify(initialPreference)}，实际=${codecKind(codec)}`);
+      throw new Error(`候选不再满足干净 AV1 对照：初始值=${JSON.stringify(initialPreference)}，实际=${codecKind(codec)}，powerEfficient=${efficient}`);
     }
-    addResult('对照组（不注入）', 'PASS', { codec, powerEfficient: efficient });
+    addResult('对照组（不注入）', 'PASS', {
+      codec, powerEfficient: efficient, reason: `AV1 硬解实测=${efficient ? '有' : '无'}`,
+    });
   }, { attempts: ugcAttempts, beforeObserver: RESET_CODEC_PREFERENCE });
 
   await runScenario('编码三态向后兼容', async cdp => {
@@ -727,7 +765,7 @@ async function main() {
     });
   }, { attempts: ugcAttempts });
 
-  await testSimple('普通 UGC 视频页', ugcUrls, ['HEVC', 'AVC']);
+  await testSimple('普通 UGC 视频页', ugcUrls, expectedLiveCodecs, { beforeObserver: actualCodecSetup });
 
   await runScenario('CDN 模块', async (cdp, attempt) => {
     await navigate(cdp, ugcUrlFor(attempt));
@@ -871,55 +909,64 @@ async function main() {
     }
   });
 
-  await runScenario('长时播放与媒体切换有界', async (cdp, attempt) => {
-    await navigate(cdp, ugcUrlFor(attempt));
-    await waitFor(() => cdp.eval('window.__biliBoost?.诊断状态 || null'), {
-      timeout: 10_000,
-      label: 'diagnostic state',
-    });
-    const audit = await cdp.eval(String.raw`(async () => {
-      const host = 'upos-sz-mirror08c.bilivideo.com';
-      const openOnly = url => {
-        const xhr = new XMLHttpRequest();
-        xhr.open('GET', url);
-      };
-      for (let i = 0; i < 2000; i++) {
-        openOnly('https://' + host + '/qa/long-play/segment-' + i + '.m4s?token=qa');
-      }
-      const afterSegments = window.__biliBoost.诊断状态;
-      window.__biliBoost.手动选源(host);
-      const beforeSwitch = window.__biliBoost.诊断状态;
-      for (let i = 1; i <= 20; i++) {
-        history.pushState({}, '', '/video/BV1QATEST?p=' + i);
-        dispatchEvent(new PopStateEvent('popstate'));
-        openOnly('https://' + host + '/qa/spa-' + i + '/segment.m4s');
-      }
-      const afterSpa = window.__biliBoost.诊断状态;
+  const testLongPlayback = async av1Hardware => {
+    const capabilityLabel = av1Hardware ? '有 AV1 硬解' : '无 AV1 硬解';
+    const name = `长时播放与媒体切换有界（${capabilityLabel}）`;
+    await runScenario(name, async cdp => {
+      await navigate(cdp, `https://www.bilibili.com/robots.txt?qa_long=${Number(av1Hardware)}`);
+      const detected = await cdp.eval('window.__biliBoost.重新探测AV1()', true);
+      const codecState = await cdp.eval('({ hardware: window.__biliBoost.AV1硬解, mode: window.__biliBoost.编码模块 })');
+      const expectedHardware = av1Hardware ? '有' : '无';
+      const capabilityOk = codecState.hardware === expectedHardware &&
+        (av1Hardware ? /有 AV1 硬解 → 不干预/.test(codecState.mode) : /无 AV1 硬解 → 剔除 AV1/.test(codecState.mode));
+      const audit = await cdp.eval(String.raw`(async () => {
+        const host = 'upos-sz-mirror08c.bilivideo.com';
+        const openOnly = url => {
+          const xhr = new XMLHttpRequest();
+          xhr.open('GET', url);
+        };
+        for (let i = 0; i < 2000; i++) {
+          openOnly('https://' + host + '/qa/long-play/segment-' + i + '.m4s?token=qa');
+        }
+        const afterSegments = window.__biliBoost.诊断状态;
+        window.__biliBoost.手动选源(host);
+        const beforeSwitch = window.__biliBoost.诊断状态;
+        for (let i = 1; i <= 20; i++) {
+          history.pushState({}, '', '/video/BV1QATEST?p=' + i);
+          dispatchEvent(new PopStateEvent('popstate'));
+          openOnly('https://' + host + '/qa/spa-' + i + '/segment.m4s');
+        }
+        const afterSpa = window.__biliBoost.诊断状态;
 
-      // 同 URL 内的 playurl 参数变化确定性模拟“切清晰度”；cid 变化模拟“切分 P”。
-      openOnly('https://api.bilibili.com/x/player/playurl?bvid=BV1QATEST&cid=100&qn=32&fnval=16');
-      const beforeQuality = window.__biliBoost.诊断状态;
-      openOnly('https://api.bilibili.com/x/player/playurl?bvid=BV1QATEST&cid=100&qn=64&fnval=16');
-      const afterQuality = window.__biliBoost.诊断状态;
-      openOnly('https://api.bilibili.com/x/player/playurl?bvid=BV1QATEST&cid=101&qn=64&fnval=16');
-      const afterPart = window.__biliBoost.诊断状态;
-      await new Promise(resolve => setTimeout(resolve, 100));
-      return { afterSegments, beforeSwitch, afterSpa, beforeQuality, afterQuality, afterPart,
-        settled: window.__biliBoost.诊断状态 };
-    })()`, true);
-    const bounded = Object.values(audit).every(state =>
-      state.rejected <= 1 && state.picked <= 1 && state.manual <= 1 && state.probing <= 1 &&
-      state.perf <= 6 && state.blacklist <= 64 && state.probeControllers <= 6 &&
-      state.fetchObservers <= 32 && state.health <= 32 && state.warningTimers <= 1);
-    const transitionsReset = audit.afterSpa.generation >= audit.afterSegments.generation + 20 &&
-      audit.afterSpa.manual === 0 && audit.afterQuality.generation > audit.beforeQuality.generation &&
-      audit.afterPart.generation > audit.afterQuality.generation && audit.afterPart.picked === 0 &&
-      audit.afterPart.manual === 0;
-    const pass = bounded && transitionsReset;
-    addResult('长时播放与媒体切换有界', pass ? 'PASS' : 'FAIL', {
-      reason: pass ? '确定性模拟 2000 分片 + 20 次 SPA + 切清晰度/分 P；集合、数组、探测器和定时器均有界且媒体态重置' : JSON.stringify(audit),
-    });
-  }, { attempts: ugcAttempts });
+        // 同 URL 内的 playurl 参数变化确定性模拟“切清晰度”；cid 变化模拟“切分 P”。
+        openOnly('https://api.bilibili.com/x/player/playurl?bvid=BV1QATEST&cid=100&qn=32&fnval=16');
+        const beforeQuality = window.__biliBoost.诊断状态;
+        openOnly('https://api.bilibili.com/x/player/playurl?bvid=BV1QATEST&cid=100&qn=64&fnval=16');
+        const afterQuality = window.__biliBoost.诊断状态;
+        openOnly('https://api.bilibili.com/x/player/playurl?bvid=BV1QATEST&cid=101&qn=64&fnval=16');
+        const afterPart = window.__biliBoost.诊断状态;
+        await new Promise(resolve => setTimeout(resolve, 100));
+        return { afterSegments, beforeSwitch, afterSpa, beforeQuality, afterQuality, afterPart,
+          settled: window.__biliBoost.诊断状态 };
+      })()`, true);
+      const bounded = Object.values(audit).every(state =>
+        state.rejected <= 1 && state.picked <= 1 && state.manual <= 1 && state.probing <= 1 &&
+        state.perf <= 6 && state.blacklist <= 64 && state.probeControllers <= 6 &&
+        state.fetchObservers <= 32 && state.health <= 32 && state.warningTimers <= 1);
+      const transitionsReset = audit.afterSpa.generation >= audit.afterSegments.generation + 20 &&
+        audit.afterSpa.manual === 0 && audit.afterQuality.generation > audit.beforeQuality.generation &&
+        audit.afterPart.generation > audit.afterQuality.generation && audit.afterPart.picked === 0 &&
+        audit.afterPart.manual === 0;
+      const pass = capabilityOk && bounded && transitionsReset;
+      addResult(name, pass ? 'PASS' : 'FAIL', {
+        codec: `${codecState.hardware}｜${codecState.mode}`,
+        reason: pass ? `${detected}；确定性模拟 2000 分片 + 20 次 SPA + 切清晰度/分 P；资源有界且媒体态重置` :
+          JSON.stringify({ detected, codecState, audit }),
+      });
+    }, { beforeObserver: RESET_CODEC_AUTO, prelude: codecProbePrelude(av1Hardware) });
+  };
+  await testLongPlayback(false);
+  await testLongPlayback(true);
 
   await runScenario('防重复注入', async (cdp, attempt) => {
     await navigate(cdp, ugcUrlFor(attempt));
@@ -938,7 +985,7 @@ async function main() {
     addResult('防重复注入', pass ? 'PASS' : 'FAIL', {
       reason: pass ? '重复执行后 HUD 仍为一个，fetch/open/send/addSourceBuffer 均未再次包装' : JSON.stringify(checked),
     });
-  }, { injectTwice: true, attempts: ugcAttempts });
+  }, { injectTwice: true, beforeObserver: actualCodecSetup, attempts: ugcAttempts });
 
   // iPhone Safari 只暴露 ManagedMediaSource（继承 MediaSource），全局没有 MediaSource。
   // 在 Chrome 里按 WebKit IDL 的继承关系造出同形环境：脚本必须完整初始化，
@@ -1076,71 +1123,88 @@ async function main() {
     }, { legacyOrder });
   }
 
-  await runScenario('playurl 劫持层（mock）', async (cdp, attempt) => {
-    await navigate(cdp, ugcUrlFor(attempt));
-    const body = Buffer.from(JSON.stringify(MOCK_PLAYURL)).toString('base64');
-    let interceptionError;
-    const off = cdp.on('Fetch.requestPaused', async event => {
-      try {
-        await cdp.send('Fetch.fulfillRequest', {
-          requestId: event.requestId,
-          responseCode: 200,
-          responseHeaders: [
-            { name: 'Content-Type', value: 'application/json' },
-            { name: 'Access-Control-Allow-Origin', value: '*' },
-          ],
-          body,
-        });
-      } catch (error) {
-        interceptionError = error;
-      }
-    });
-    try {
-      await cdp.send('Fetch.enable', { patterns: [{ urlPattern: '*playurl*' }] });
-      const outputs = await cdp.eval(String.raw`(async () => {
-        const base = 'https://api.bilibili.com/x/player/playurl?qa_boost_mock=';
-        const xhr = (suffix, responseType) => new Promise((resolve, reject) => {
-          const request = new XMLHttpRequest();
-          request.open('GET', base + suffix);
-          if (responseType) request.responseType = responseType;
-          request.onload = () => {
-            try { resolve(responseType === 'json' ? request.response : JSON.parse(request.responseText)); }
-            catch (error) { reject(error); }
-          };
-          request.onerror = () => reject(new Error('mock XHR network error'));
-          request.send();
-        });
-        return {
-          fetch: await (await fetch(base + 'fetch')).json(),
-          xhr_responseText: await xhr('xhr_responseText', ''),
-          xhr_responseType_json: await xhr('xhr_responseType_json', 'json')
-        };
-      })()`, true);
-      if (interceptionError) throw interceptionError;
-
-      const expected = ['HEVC/80', 'AVC/80', 'HEVC/32', 'AVC/32'];
-      const failures = [];
-      for (const [name, payload] of Object.entries(outputs)) {
-        const data = payload?.data || payload?.result || payload;
-        const response = {
-          order: (data?.dash?.video || []).map(item => ({ id: item.id, codecid: item.codecid })),
-        };
-        const order = responseOrder(response);
-        if ((data?.dash?.video || []).some(item => item.codecid === 13)) failures.push(`${name}: 仍有 AV1`);
-        if (JSON.stringify(order) !== JSON.stringify(expected)) failures.push(`${name}: 顺序=${order.join(', ')}`);
-        if ((data?.support_formats || []).some(format => format.codecs?.some(codec => /^av01/i.test(codec)))) {
-          failures.push(`${name}: support_formats 仍有 AV1`);
+  const testPlayurlMock = async av1Hardware => {
+    const capabilityLabel = av1Hardware ? '有 AV1 硬解' : '无 AV1 硬解';
+    const name = `playurl 劫持层（mock，${capabilityLabel}）`;
+    await runScenario(name, async cdp => {
+      await navigate(cdp, `${ugcUrlFor(0)}?qa_playurl=${Number(av1Hardware)}`);
+      const detected = await cdp.eval('window.__biliBoost.重新探测AV1()', true);
+      const codecState = await cdp.eval('({ hardware: window.__biliBoost.AV1硬解, mode: window.__biliBoost.编码模块 })');
+      const body = Buffer.from(JSON.stringify(MOCK_PLAYURL)).toString('base64');
+      let interceptionError;
+      const off = cdp.on('Fetch.requestPaused', async event => {
+        try {
+          await cdp.send('Fetch.fulfillRequest', {
+            requestId: event.requestId,
+            responseCode: 200,
+            responseHeaders: [
+              { name: 'Content-Type', value: 'application/json' },
+              { name: 'Access-Control-Allow-Origin', value: '*' },
+            ],
+            body,
+          });
+        } catch (error) {
+          interceptionError = error;
         }
-      }
-      addResult('playurl 劫持层（mock）', failures.length ? 'FAIL' : 'PASS', {
-        codec: expected.join(', '),
-        reason: failures.length ? failures.join('；') : 'fetch / xhr.responseText / xhr.responseType=json 均已清除 AV1；support_formats 已清理',
       });
-    } finally {
-      off();
-      try { await cdp.send('Fetch.disable'); } catch {}
-    }
-  }, { attempts: ugcAttempts, beforeObserver: FORCE_CODEC_MODULE });
+      try {
+        await cdp.send('Fetch.enable', { patterns: [{ urlPattern: '*playurl*' }] });
+        const outputs = await cdp.eval(String.raw`(async () => {
+          const base = 'https://api.bilibili.com/x/player/playurl?qa_boost_mock=';
+          const xhr = (suffix, responseType) => new Promise((resolve, reject) => {
+            const request = new XMLHttpRequest();
+            request.open('GET', base + suffix);
+            if (responseType) request.responseType = responseType;
+            request.onload = () => {
+              try { resolve(responseType === 'json' ? request.response : JSON.parse(request.responseText)); }
+              catch (error) { reject(error); }
+            };
+            request.onerror = () => reject(new Error('mock XHR network error'));
+            request.send();
+          });
+          return {
+            fetch: await (await fetch(base + 'fetch')).json(),
+            xhr_responseText: await xhr('xhr_responseText', ''),
+            xhr_responseType_json: await xhr('xhr_responseType_json', 'json')
+          };
+        })()`, true);
+        if (interceptionError) throw interceptionError;
+
+        const expected = av1Hardware
+          ? ['AVC/80', 'AV1/80', 'HEVC/80', 'AVC/32', 'AV1/32', 'HEVC/32']
+          : ['HEVC/80', 'AVC/80', 'HEVC/32', 'AVC/32'];
+        const failures = [];
+        const expectedHardware = av1Hardware ? '有' : '无';
+        if (codecState.hardware !== expectedHardware) failures.push(`能力状态=${codecState.hardware}`);
+        if (av1Hardware ? !/有 AV1 硬解 → 不干预/.test(codecState.mode) : !/无 AV1 硬解 → 剔除 AV1/.test(codecState.mode)) {
+          failures.push(`自动模式=${codecState.mode}`);
+        }
+        for (const [channel, payload] of Object.entries(outputs)) {
+          const data = payload?.data || payload?.result || payload;
+          const response = {
+            order: (data?.dash?.video || []).map(item => ({ id: item.id, codecid: item.codecid })),
+          };
+          const order = responseOrder(response);
+          const hasAv1 = (data?.dash?.video || []).some(item => item.codecid === 13);
+          const supportHasAv1 = (data?.support_formats || []).some(format =>
+            format.codecs?.some(codec => /^av01/i.test(codec)));
+          if (hasAv1 !== av1Hardware) failures.push(`${channel}: dash AV1=${hasAv1}`);
+          if (supportHasAv1 !== av1Hardware) failures.push(`${channel}: support_formats AV1=${supportHasAv1}`);
+          if (JSON.stringify(order) !== JSON.stringify(expected)) failures.push(`${channel}: 顺序=${order.join(', ')}`);
+        }
+        addResult(name, failures.length ? 'FAIL' : 'PASS', {
+          codec: expected.join(', '),
+          reason: failures.length ? failures.join('；') :
+            `${detected}；fetch / xhr.responseText / xhr.responseType=json 均按 auto ${av1Hardware ? '保留' : '清除'} AV1`,
+        });
+      } finally {
+        off();
+        try { await cdp.send('Fetch.disable'); } catch {}
+      }
+    }, { beforeObserver: RESET_CODEC_AUTO, prelude: codecProbePrelude(av1Hardware) });
+  };
+  await testPlayurlMock(false);
+  await testPlayurlMock(true);
 
   if (!targets.bangumi.length) {
     addResult('番剧页', 'FAIL', { reason: '没有可供有界重试的番剧候选' });
@@ -1159,7 +1223,7 @@ async function main() {
         codec, powerEfficient: efficient,
         reason: pass ? '' : `注入后仍选用 ${codecKind(codec)}`,
       });
-    }, { attempts: Math.min(MAX_LIVE_ATTEMPTS, targets.bangumi.length) });
+    }, { beforeObserver: actualCodecSetup, attempts: Math.min(MAX_LIVE_ATTEMPTS, targets.bangumi.length) });
   }
 
   if (!targets.multi.length) {
@@ -1211,12 +1275,12 @@ async function main() {
         addResult('多 P 视频切 P', 'SKIPPED', { codec, powerEfficient: efficient, reason: 'playurl 响应不含可验证的 DASH 视频流' });
         return;
       }
-      const pass = !response.hasAv1 && !response.supportHasAv1;
+      const pass = response.hasAv1 === targets.av1Hardware && response.supportHasAv1 === targets.av1Hardware;
       addResult('多 P 视频切 P', pass ? 'PASS' : 'FAIL', {
         codec, powerEfficient: efficient,
-        reason: `${pass ? '' : '脚本改写后的 playurl 响应仍残留 AV1；'}顺序=${responseOrder(response).join(', ')}; playurl=${calls.at(-1)}`,
+        reason: `${pass ? '' : `AV1 能力分支不符（dash=${response.hasAv1}, support=${response.supportHasAv1}）；`}顺序=${responseOrder(response).join(', ')}; playurl=${calls.at(-1)}`,
       });
-    }, { attempts: Math.min(MAX_LIVE_ATTEMPTS, targets.multi.length) });
+    }, { beforeObserver: actualCodecSetup, attempts: Math.min(MAX_LIVE_ATTEMPTS, targets.multi.length) });
   }
 
   await runScenario('切清晰度', async (cdp, attempt) => {
@@ -1274,12 +1338,12 @@ async function main() {
       addResult('切清晰度', 'SKIPPED', { codec, powerEfficient: efficient, reason: 'playurl 响应不含可验证的 DASH 视频流' });
       return;
     }
-    const pass = !response.hasAv1 && !response.supportHasAv1;
+    const pass = response.hasAv1 === targets.av1Hardware && response.supportHasAv1 === targets.av1Hardware;
     addResult('切清晰度', pass ? 'PASS' : 'FAIL', {
       codec, powerEfficient: efficient,
-      reason: `${pass ? '' : '脚本改写后的 playurl 响应仍残留 AV1；'}${action.via}→${action.text}; 顺序=${responseOrder(response).join(', ')}; playurl=${calls.at(-1)}`,
+      reason: `${pass ? '' : `AV1 能力分支不符（dash=${response.hasAv1}, support=${response.supportHasAv1}）；`}${action.via}→${action.text}; 顺序=${responseOrder(response).join(', ')}; playurl=${calls.at(-1)}`,
     });
-  }, { attempts: ugcAttempts });
+  }, { beforeObserver: actualCodecSetup, attempts: ugcAttempts });
 
   await runScenario('HUD 检查', async (cdp, attempt) => {
     await navigate(cdp, ugcUrlFor(attempt));
@@ -1296,17 +1360,20 @@ async function main() {
       return values.findLast(value => /B站提供：/.test(value) && /🟢 硬解/.test(value) && /powerEfficient：true/.test(value)) || null;
     }, { timeout: 12_000, interval: 100, label: 'HUD text after loadedmetadata (up to 1.5 seconds delayed)' });
     const kind = codecKind(codec);
-    const labelOk = kind === 'HEVC' ? /编码：HEVC\/H\.265/.test(hud) : kind === 'AVC' && /编码：AVC\/H\.264/.test(hud);
+    const labelOk = kind === 'AV1' ? /编码：AV1/.test(hud) :
+      kind === 'HEVC' ? /编码：HEVC\/H\.265/.test(hud) : kind === 'AVC' && /编码：AVC\/H\.264/.test(hud);
     const efficiencyOk = efficient === true && /🟢 硬解/.test(hud) && /powerEfficient：true/.test(hud);
-    const offeredOk = /B站提供：/.test(hud) && /AV1/.test(hud);
-    const strippedOk = /已剔除 AV1：\d+ 条/.test(hud);
-    const pass = labelOk && efficiencyOk && offeredOk && strippedOk;
+    const policyOk = targets.av1Hardware
+      ? kind === 'AV1' && /已剔除 AV1：0 条/.test(hud) && /自动｜本机有 AV1 硬解 → 不干预/.test(hud)
+      : ['HEVC', 'AVC'].includes(kind) && /B站提供：.*AV1/.test(hud) && /已剔除 AV1：[1-9]\d* 条/.test(hud) &&
+        /自动｜本机无 AV1 硬解 → 剔除 AV1/.test(hud);
+    const pass = labelOk && efficiencyOk && policyOk;
     addResult('HUD 检查', pass ? 'PASS' : 'FAIL', {
       codec,
       powerEfficient: efficient,
-      reason: `${pass ? '' : 'HUD 字段与实际观测不一致；'}HUD=${JSON.stringify(hud)}`,
+      reason: `${pass ? `实测${targets.av1Hardware ? '有' : '无'} AV1 硬解，HUD 与 auto 分支一致；` : 'HUD 字段与实际能力分支不一致；'}HUD=${JSON.stringify(hud)}`,
     });
-  }, { attempts: ugcAttempts });
+  }, { beforeObserver: actualCodecSetup, attempts: ugcAttempts });
 }
 
 function waitForChildExit(child, timeout) {
