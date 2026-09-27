@@ -1,6 +1,14 @@
 #!/usr/bin/env node
 
 import { execFile, execFileSync, spawn } from 'node:child_process';
+// 用户 2026-09-27：Mac 上开 Chrome 播视频太吵 → 在 macOS 上直接转交 tools/qa-on-win.sh 在 Win 台式机跑。
+// 确需在 Mac 本机跑时设 BILI_BOOST_QA_ALLOW_MAC=1。
+if (process.platform === 'darwin' && process.env.BILI_BOOST_QA_ALLOW_MAC !== '1') {
+  const { spawnSync } = await import('node:child_process');
+  console.error('[qa-boost] macOS：转到 Win 台式机运行（tools/qa-on-win.sh）；本机强制运行请设 BILI_BOOST_QA_ALLOW_MAC=1');
+  const r = spawnSync(new URL('./qa-on-win.sh', import.meta.url).pathname, [], { stdio: 'inherit' });
+  process.exit(r.status ?? 1);
+}
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
