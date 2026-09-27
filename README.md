@@ -328,16 +328,18 @@ PASS     fetch 实测速与卡顿过滤      Response 语义不变；初始/seek
 PASS     分片热路径微基准           54.3ms → 14.5ms（3.73×）
 PASS     长时播放与媒体切换有界      2000 分片 + 20 次 SPA + 切清晰度/分 P
 PASS     防重复注入                 四个 hook 均未再次包装
+PASS     Safari 仅 ManagedMediaSource  iPhone API 形态可完整初始化
+PASS     Safari 双全局共享原型去重     两个构造器共用的 hook 只包装一次
 PASS ×2  旧版冲突检测               两种注入顺序
 PASS     playurl 劫持层（mock）      fetch / XHR text / XHR json
 PASS     番剧页                     avc1... / powerEfficient=true
 PASS     HUD 检查                   🟢 硬解 · HEVC/H.265
 SKIPPED  多 P 视频切 P              未登录流已内联，无 playurl 请求
 SKIPPED  切清晰度                   同上
-总计：PASS=15 FAIL=0 SKIPPED=2
+总计：PASS=17 FAIL=0 SKIPPED=2
 ```
 
-**对照组是最有价值的一条**：不注入脚本时拿到的是 `av01` 且 `powerEfficient=false`，反证了测试本身有区分度。
+**对照组是最有价值的一条**：不注入脚本时拿到的是 `av01` 且 `powerEfficient=false`，反证了测试本身有区分度。测试器会先从首页候选中实播并确认已创建视频 `SourceBuffer`，避免把未开播、付费或充电专属页面误报成脚本回归。
 
 播放器在未登录时不会发 playurl，所以编码模块的第 3/4 层用 CDP `Fetch` mock 一个含「两档清晰度 × 三种编码」的响应来确定性验证，不依赖 B 站的真实行为。多 P 与切清晰度的真实 UI 用例仍会尝试执行；未登录页面不发新请求时，另有确定性模拟验证 20 次 SPA、`cid`（分 P）及 `qn/fnval`（清晰度）变化都会重置媒体态。
 
