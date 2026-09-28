@@ -354,6 +354,13 @@ function codecKind(mime = '') {
   return 'UNKNOWN';
 }
 
+function liveCodecPolicy(av1Hardware, kind, policy) {
+  const allowed = av1Hardware ? ['AV1', 'HEVC', 'AVC'] : ['HEVC', 'AVC'];
+  const policyOk = policy.hardware === (av1Hardware ? '有' : '无') &&
+    (av1Hardware ? /有 AV1 硬解 → 不干预/.test(policy.mode) : /无 AV1 硬解 → 剔除 AV1/.test(policy.mode));
+  return { allowed, pass: allowed.includes(kind) && policyOk };
+}
+
 function responseOrder(response) {
   const names = { 7: 'AVC', 12: 'HEVC', 13: 'AV1' };
   return (response?.order || []).map(item => `${names[item.codecid] || item.codecid}/${item.id}`);
@@ -699,11 +706,16 @@ async function main() {
     const forcedOn = await readModeAfterReload(true, 'true');
     const forcedOff = await readModeAfterReload(false, 'false');
     const automatic = await readModeAfterReload('auto', 'auto', true);
+    const hardwarePolicy = { hardware: '有', mode: '自动｜本机有 AV1 硬解 → 不干预' };
+    const softwarePolicy = { hardware: '无', mode: '自动｜本机无 AV1 硬解 → 剔除 AV1' };
+    const liveOraclePass = ['AV1', 'HEVC', 'AVC'].every(kind => liveCodecPolicy(true, kind, hardwarePolicy).pass) &&
+      ['HEVC', 'AVC'].every(kind => liveCodecPolicy(false, kind, softwarePolicy).pass) &&
+      !liveCodecPolicy(false, 'AV1', softwarePolicy).pass;
     const pass = /^强制开/.test(forcedOn.mode) && /^强制关/.test(forcedOff.mode) &&
-      /自动｜未知 → 暂按剔除 AV1/.test(automatic.mode) && automatic.av1 === '未探测';
+      /自动｜未知 → 暂按剔除 AV1/.test(automatic.mode) && automatic.av1 === '未探测' && liveOraclePass;
     addResult('编码三态向后兼容', pass ? 'PASS' : 'FAIL', {
-      reason: pass ? '旧 bhw_codec=true/false 语义不变；auto+null 仍保守剔除 AV1' :
-        JSON.stringify({ forcedOn, forcedOff, automatic }),
+      reason: pass ? '旧 bhw_codec=true/false 语义不变；auto+null 仍保守剔除 AV1；live oracle 双能力矩阵正确' :
+        JSON.stringify({ forcedOn, forcedOff, automatic, liveOraclePass }),
     });
   });
 
@@ -1209,8 +1221,8 @@ async function main() {
   if (!targets.bangumi.length) {
     addResult('番剧页', 'FAIL', { reason: '没有可供有界重试的番剧候选' });
   } else {
-    // 2026-09 实测：未登录番剧选择 AVC (avc1.64001E) 而非 HEVC；
-    // powerEfficient=true，属于可接受硬解。番剧登录后的策略仍需另行复测。
+    // 番剧候选没有“干净对照必须选 AV1”的前置条件，服务端可合法选择任一可播编码。
+    // auto 的业务语义是有 AV1 硬解时不干预（接受 AV1/HEVC/AVC），无硬解时才禁止 AV1。
     await runScenario('番剧页', async (cdp, attempt) => {
       const url = targets.bangumi[attempt % targets.bangumi.length];
       await navigate(cdp, url);
@@ -1218,10 +1230,13 @@ async function main() {
       try { codec = await waitForCodec(cdp); }
       catch { throw new Error(await classifyNoPlayback(cdp, `番剧页 ${url}`)); }
       const efficient = await powerEfficient(cdp, codec);
-      const pass = ['HEVC', 'AVC'].includes(codecKind(codec));
-      addResult('番剧页', pass ? 'PASS' : 'FAIL', {
+      const kind = codecKind(codec);
+      const policy = await cdp.eval('({ hardware: window.__biliBoost?.AV1硬解, mode: window.__biliBoost?.编码模块 })');
+      const verdict = liveCodecPolicy(targets.av1Hardware, kind, policy);
+      addResult('番剧页', verdict.pass ? 'PASS' : 'FAIL', {
         codec, powerEfficient: efficient,
-        reason: pass ? '' : `注入后仍选用 ${codecKind(codec)}`,
+        reason: verdict.pass ? `实测${policy.hardware} AV1 硬解，auto ${targets.av1Hardware ? '不干预' : '剔除 AV1'}；服务端选择 ${kind}` :
+          JSON.stringify({ kind, allowed: verdict.allowed, policy }),
       });
     }, { beforeObserver: actualCodecSetup, attempts: Math.min(MAX_LIVE_ATTEMPTS, targets.bangumi.length) });
   }

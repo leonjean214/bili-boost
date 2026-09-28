@@ -333,7 +333,7 @@ PASS     Safari 仅 ManagedMediaSource  iPhone API 形态可完整初始化
 PASS     Safari 双全局共享原型去重     两个构造器共用的 hook 只包装一次
 PASS ×2  旧版冲突检测               两种注入顺序
 PASS ×2  playurl 劫持层（mock）      有硬解保留 AV1；无硬解三通道清除 AV1
-PASS     番剧页                     avc1... / powerEfficient=true
+PASS     番剧页                     有硬解不干预；无硬解禁止 AV1
 PASS     HUD 检查                   实测能力、编码和 auto 策略一致
 SKIPPED  多 P 视频切 P              未登录流已内联，无 playurl 请求
 SKIPPED  切清晰度                   同上
@@ -342,7 +342,7 @@ SKIPPED  切清晰度                   同上
 
 **对照组是最有价值的一条**：不注入脚本时必须拿到 `av01`，并以 `powerEfficient` 的实际结果冻结本机能力分支。测试器在每个候选文档的 Observer 运行前清除编码偏好；只有“干净对照选择 AV1、注入后按实测能力保留 AV1 或改选 HEVC/AVC”的视频才进入场景池。后续外部 UGC/番剧场景遇到导航、网络或 CDP 瞬态错误时，会换全新页面和下一个已验证候选，最多三次，不放宽业务断言。
 
-播放器在未登录时不会发 playurl，所以编码模块的第 3/4 层用 CDP `Fetch` mock 一个含「两档清晰度 × 三种编码」的响应来确定性验证，不依赖 B 站的真实行为。mock 与长时资源用例都分别模拟“有 AV1 硬解”和“无 AV1 硬解”：前者验证 `auto` 原样保留 AV1，后者验证 fetch、XHR text、XHR json 与 `support_formats` 均清除 AV1；资源上限和 `cid/qn/fnval` 状态隔离在两个分支都执行。多 P 与切清晰度的真实 UI 用例仍会尝试执行；未登录页面不发新请求或有界发现未找到可播放多 P 时会如实 SKIPPED。
+播放器在未登录时不会发 playurl，所以编码模块的第 3/4 层用 CDP `Fetch` mock 一个含「两档清晰度 × 三种编码」的响应来确定性验证，不依赖 B 站的真实行为。mock 与长时资源用例都分别模拟“有 AV1 硬解”和“无 AV1 硬解”：前者验证 `auto` 原样保留 AV1，后者验证 fetch、XHR text、XHR json 与 `support_formats` 均清除 AV1；资源上限和 `cid/qn/fnval` 状态隔离在两个分支都执行。番剧页没有“服务端一定选择 AV1”的候选前置：有硬解时 AV1/HEVC/AVC 都可接受，但必须处于 `auto` 不干预；无硬解时只允许 HEVC/AVC 且必须显示剔除 AV1。多 P 与切清晰度的真实 UI 用例仍会尝试执行；未登录页面不发新请求或有界发现未找到可播放多 P 时会如实 SKIPPED。
 
 ---
 
