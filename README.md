@@ -312,10 +312,11 @@ __biliBoost.清空主机健康()
 ## 回归测试
 
 ```bash
-node tools/qa-boost.mjs        # 默认端口 9333，可用 BILI_BOOST_QA_PORT 覆盖
+./tools/qa-on-win.sh           # 从 Mac 打包到 Win 桌面会话，运行有窗口静音 Chrome
+node tools/qa-boost.mjs        # 在 macOS 上会自动转交上面的 Win runner
 ```
 
-会起一个独立 profile 的 Chrome，跑完自动清理。当前结果（未登录，M2 / Chrome 152）：
+每次 runner 都使用独立的远端目录、计划任务、压缩包和 CDP 端口，可供并行验收；900 秒内未收到原子退出码文件会回显日志并失败，结束后只清理本次进程与文件。当前结果（未登录，Windows RTX 5090）：
 
 ```
 PASS     对照组（不注入）          av01... / 实测 AV1 powerEfficient
