@@ -824,6 +824,73 @@ async function main() {
     });
   }, { attempts: ugcAttempts, beforeObserver: HEALTH_BOUNDARY_SETUP });
 
+  // 用户反馈的 08h 节点只作为新增候选：成功才进入自动选择，故障时不应成为播放地址。
+  const candidate08h = 'upos-sz-mirror08h.bilivideo.com';
+  for (const available of [true, false]) {
+    const name = `新增 CDN 候选（${available ? '可用' : '不可用回退'}）`;
+    await runScenario(name, async cdp => {
+      await navigate(cdp, 'https://www.bilibili.com/robots.txt');
+      const original = 'upos-sz-mirrorali.bilivideo.com';
+      const path = `/qa-candidate-${available ? 'ok' : 'fail'}/qa-new-cdn.m4s`;
+      const resource = `https://${original}${path}`;
+      const data = Buffer.alloc(512 * 1024, 0x91);
+      const body = data.toString('base64');
+      const requested = [];
+      let interceptionError;
+      const off = cdp.on('Fetch.requestPaused', async event => {
+        try {
+          const url = new URL(event.request.url);
+          requested.push(url.hostname);
+          const success = available && url.hostname === candidate08h;
+          const middle = !!event.request.headers.Range || !!event.request.headers.range;
+          await cdp.send('Fetch.fulfillRequest', {
+            requestId: event.requestId,
+            responseCode: success ? (middle ? 206 : 200) : 503,
+            responseHeaders: [
+              { name: 'Content-Type', value: 'video/mp4' },
+              { name: 'Access-Control-Allow-Origin', value: '*' },
+              { name: 'Access-Control-Allow-Headers', value: 'Range' },
+              ...(middle && success ? [{ name: 'Content-Range', value: 'bytes 1048576-1572863/2097152' }] : []),
+            ],
+            body: success ? body : '',
+          });
+        } catch (error) { interceptionError = error; }
+      });
+      try {
+        await cdp.send('Fetch.enable', { patterns: [{ urlPattern: '*qa-new-cdn.m4s*' }] });
+        await cdp.eval(`new XMLHttpRequest().open('GET', ${JSON.stringify(resource)});`);
+        await waitFor(() => cdp.eval('window.__biliBoost?.诊断状态?.probing === 0 && window.__biliBoost?.黑名单?.length > 0'), {
+          timeout: 20_000, interval: 100, label: 'new CDN candidate probe settled',
+        });
+        if (interceptionError) throw interceptionError;
+        const audit = await cdp.eval(`(() => {
+          const api = window.__biliBoost;
+          new XMLHttpRequest().open('GET', ${JSON.stringify(resource)});
+          const result = api.测速结果;
+          return {
+            win: result?.win || null,
+            precise: result?.list.find(item => item.host === ${JSON.stringify(candidate08h)} && item.ok && item.points?.length === 2) != null,
+            source: api.当前源,
+            blacklisted: api.黑名单.includes(${JSON.stringify(candidate08h)}),
+            manual: ${available ? `api.手动选源(${JSON.stringify(candidate08h)})` : "'未手选故障源'"},
+          };
+        })()`);
+        const attempted = requested.includes(candidate08h);
+        const pass = available
+          ? attempted && audit.win === candidate08h && audit.precise &&
+            audit.source === candidate08h && !audit.blacklisted && audit.manual.includes(candidate08h)
+          : attempted && audit.win === null && audit.source === original && audit.blacklisted;
+        addResult(name, pass ? 'PASS' : 'FAIL', {
+          reason: pass ? (available ? '08h 经头部/中段测速后可自动及手动选择' : '08h 测速失败后加入黑名单并沿用原始源') :
+            JSON.stringify({ attempted, audit, requested }),
+        });
+      } finally {
+        off();
+        try { await cdp.send('Fetch.disable'); } catch {}
+      }
+    }, { beforeObserver: String.raw`try { localStorage.removeItem('biliCdnWinner'); localStorage.removeItem('bhw_health'); } catch {}` });
+  }
+
   await runScenario('fetch 实测速与卡顿过滤', async cdp => {
     await navigate(cdp, 'https://www.bilibili.com/robots.txt');
     const host = 'upos-sz-mirrorcosov.bilivideo.com';
