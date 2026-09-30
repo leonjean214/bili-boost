@@ -35,6 +35,16 @@ if (process.env.BILI_BOOST_QA_LEGACY) {
     stdio: ['ignore', 'pipe', 'ignore'],
   });
 } catch {}
+const soakArg = process.argv.find(arg => arg.startsWith('--soak-seconds='));
+const SOAK_SECONDS = soakArg ? Number(soakArg.slice('--soak-seconds='.length)) : 0;
+if (soakArg && (!Number.isSafeInteger(SOAK_SECONDS) || SOAK_SECONDS < 1 || SOAK_SECONDS > 7200)) {
+  throw new Error('--soak-seconds 必须是 1..7200 的整数');
+}
+// Frozen before business changes: 32 fetch + 7 probes + 7 singleton waits/timers + 2 teardown slots.
+const RESOURCE_LIMITS = Object.freeze({ timeouts: 48, intervals: 1, listeners: 32, mutationObservers: 0 });
+// 实播有效时长连续 5 分钟不增长即判失败，避免停播后空等到 8400 秒截止。
+const SOAK_STALL_MS = 300_000;
+const RESOURCE_STEADY = Object.freeze({ timeouts: 0, intervals: 1, listeners: 11, mutationObservers: 0 });
 const results = [];
 let chrome;
 let browserCdp;
@@ -179,7 +189,12 @@ const OBSERVER = String.raw`
     mimes: [], playurl: [], playurlResponses: [], hud: [], errors: [], warnings: [],
     initialCodecPreference: localStorage.getItem('bilibili_player_codec_prefer_type')
   };
-  const remember = (list, value) => { if (value && !list.includes(value)) list.push(value); };
+  const remember = (list, value) => {
+    if (value && !list.includes(value)) {
+      list.push(value);
+      if (list.length > 64) list.shift(); // Long playback must not leak QA's own HUD history.
+    }
+  };
   const originalWarn = console.warn;
   console.warn = function(...args) {
     qa.warnings.push(args.map(value => String(value)).join(' '));
@@ -249,6 +264,131 @@ const OBSERVER = String.raw`
 })();
 `;
 
+// QA-only native API audit. Metadata never strongly owns targets/listeners/observers.
+function installResourceAudit(ranges, auditEnd) {
+  const timers = new Map();
+  const listeners = new Set();
+  const byTarget = new WeakMap();
+  const observers = new Set();
+  const byObserver = new WeakMap();
+  const peak = { timeouts: 0, intervals: 0, listeners: 0, mutationObservers: 0 };
+  const native = {
+    setTimeout: window.setTimeout, setInterval: window.setInterval,
+    clearTimeout: window.clearTimeout, clearInterval: window.clearInterval,
+    add: EventTarget.prototype.addEventListener, remove: EventTarget.prototype.removeEventListener,
+    observe: MutationObserver.prototype.observe, disconnect: MutationObserver.prototype.disconnect,
+    Observer: MutationObserver,
+  };
+  function owned() {
+    const stack = new Error().stack || '';
+    // Attribute the direct acquisition, not a deeper userscript frame that called a foreign helper.
+    const frames = [...stack.matchAll(/([^()\s]+):(\d+):(\d+)/g)];
+    const caller = frames.find(match => !(match[1] === 'bili-boost-qa-page.js' && Number(match[2]) <= auditEnd));
+    if (!caller) return false;
+    if (caller[1] === 'bili-boost-qa-fixture.js') return true;
+    return caller[1] === 'bili-boost-qa-page.js' &&
+      ranges.some(([start, end]) => Number(caller[2]) >= start && Number(caller[2]) <= end);
+  }
+  function snapshot() {
+    const out = { timeouts: 0, intervals: 0, listeners: 0, mutationObservers: 0 };
+    for (const type of timers.values()) out[type]++;
+    for (const record of listeners) {
+      if (!record.target.deref() || !record.callback.deref()) release(record);
+      else if (record.owned) out.listeners++;
+    }
+    for (const record of observers) {
+      if (!record.ref.deref()) observers.delete(record);
+      else out.mutationObservers++;
+    }
+    for (const key of Object.keys(out)) peak[key] = Math.max(peak[key], out[key]);
+    return { ...out, peak: { ...peak } };
+  }
+  window.setTimeout = function(callback, delay, ...args) {
+    if (!owned() || typeof callback !== 'function') return native.setTimeout.call(this, callback, delay, ...args);
+    const id = native.setTimeout.call(this, function(...values) {
+      timers.delete(id);
+      return callback.apply(this, values);
+    }, delay, ...args);
+    timers.set(id, 'timeouts'); snapshot(); return id;
+  };
+  window.setInterval = function(callback, delay, ...args) {
+    const track = owned();
+    const id = native.setInterval.call(this, callback, delay, ...args);
+    if (track) { timers.set(id, 'intervals'); snapshot(); }
+    return id;
+  };
+  window.clearTimeout = function(id) { timers.delete(id); return native.clearTimeout.call(this, id); };
+  window.clearInterval = function(id) { timers.delete(id); return native.clearInterval.call(this, id); };
+  function release(record) {
+    listeners.delete(record);
+    const list = byTarget.get(record.target.deref());
+    if (list) { const index = list.indexOf(record); if (index >= 0) list.splice(index, 1); }
+    const signal = record.signal?.deref();
+    if (signal && record.abort) native.remove.call(signal, 'abort', record.abort);
+  }
+  EventTarget.prototype.addEventListener = function(type, callback, options) {
+    if (!callback || (typeof callback !== 'object' && typeof callback !== 'function')) {
+      return native.add.call(this, type, callback, options);
+    }
+    type = String(type);
+    const capture = typeof options === 'boolean' ? options : Boolean(options?.capture);
+    let list = byTarget.get(this);
+    if (!list) { list = []; byTarget.set(this, list); }
+    const duplicate = list.find(r => r.type === type && r.capture === capture && r.callback.deref() === callback);
+    if (duplicate) return;
+    const signal = typeof options === 'object' ? options?.signal : null;
+    if (signal?.aborted) return native.add.call(this, type, callback, options);
+    const record = { target: new WeakRef(this), callback: new WeakRef(callback), type, capture, owned: owned() };
+    const once = typeof options === 'object' && options?.once;
+    const wrapper = function(event) {
+      if (once) release(record);
+      if (typeof callback === 'function') return callback.call(this, event);
+      return callback.handleEvent(event);
+    };
+    record.wrapper = new WeakRef(wrapper);
+    native.add.call(this, type, wrapper, options);
+    list.push(record); listeners.add(record);
+    if (signal) {
+      record.signal = new WeakRef(signal);
+      record.abort = () => release(record);
+      native.add.call(signal, 'abort', record.abort, { once: true });
+    }
+    snapshot();
+  };
+  EventTarget.prototype.removeEventListener = function(type, callback, options) {
+    const capture = typeof options === 'boolean' ? options : Boolean(options?.capture);
+    const record = byTarget.get(this)?.find(r => r.type === String(type) && r.capture === capture && r.callback.deref() === callback);
+    if (!record) return native.remove.call(this, type, callback, options);
+    native.remove.call(this, type, record.wrapper.deref(), options);
+    release(record);
+  };
+  window.MutationObserver = function(callback) {
+    const observer = new native.Observer(callback);
+    if (owned()) byObserver.set(observer, { ref: new WeakRef(observer) });
+    return observer;
+  };
+  window.MutationObserver.prototype = native.Observer.prototype;
+  Object.setPrototypeOf(window.MutationObserver, native.Observer);
+  native.Observer.prototype.observe = function(...args) {
+    const result = native.observe.apply(this, args);
+    const record = byObserver.get(this);
+    if (record) observers.add(record);
+    snapshot(); return result;
+  };
+  native.Observer.prototype.disconnect = function() {
+    observers.delete(byObserver.get(this));
+    return native.disconnect.call(this);
+  };
+  window.__qaResourceAudit = { snapshot, resetPeak() {
+    for (const key of Object.keys(peak)) peak[key] = 0;
+    return snapshot();
+  } };
+}
+
+function resourceBounded(state, limits = RESOURCE_LIMITS) {
+  return Object.entries(limits).every(([key, limit]) => state[key] <= limit);
+}
+
 async function endpoint(path, options) {
   return fetch(`http://127.0.0.1:${PORT}${path}`, options);
 }
@@ -274,6 +414,14 @@ async function newPage({ inject = false, injectTwice = false, legacyOrder = null
     };
   `;
   const parts = [];
+  const ownedRanges = [];
+  const addOwned = source => {
+    const start = parts.reduce((n, part) => n + part.split('\n').length, 1);
+    ownedRanges.push([start, start + source.split('\n').length - 1]);
+    parts.push(source);
+  };
+  // Counter runs before Observer; ownership ranges are filled after assembly without changing ordering.
+  parts.push('(' + installResourceAudit.toString() + ')(__QA_OWNED_RANGES__, ' + installResourceAudit.toString().split('\n').length + ');');
   // 对照页的存储清理必须早于 Observer，才能记录真正的初始状态；prelude 则仍在
   // Observer 之后、用户脚本之前执行，用于模拟其他浏览器的 API 形态。
   if (beforeObserver) parts.push(beforeObserver);
@@ -282,11 +430,12 @@ async function newPage({ inject = false, injectTwice = false, legacyOrder = null
   if (prelude) parts.push(prelude);
   if (inject) {
     if (legacyOrder === 'before' && LEGACY_CDN_SCRIPT) parts.push(LEGACY_CDN_SCRIPT);
-    parts.push(USER_SCRIPT);
+    addOwned(USER_SCRIPT);
     if (legacyOrder === 'after' && LEGACY_CDN_SCRIPT) parts.push(LEGACY_CDN_SCRIPT);
   }
-  if (injectTwice) parts.push(snapshot, USER_SCRIPT, verifyDuplicate);
-  const source = validateJavaScript(parts.join('\n'), 'Page.addScriptToEvaluateOnNewDocument');
+  if (injectTwice) { parts.push(snapshot); addOwned(USER_SCRIPT); parts.push(verifyDuplicate); }
+  const source = validateJavaScript(parts.join('\n').replace('__QA_OWNED_RANGES__', JSON.stringify(ownedRanges)) +
+    '\n//# sourceURL=bili-boost-qa-page.js', 'Page.addScriptToEvaluateOnNewDocument');
   await cdp.send('Page.addScriptToEvaluateOnNewDocument', { source });
   await cdp.send('Page.bringToFront');
   return { cdp, targetId: target.id };
@@ -628,6 +777,243 @@ async function testSimple(name, urls, expected, { inject = true, beforeObserver 
   }, { inject, beforeObserver, attempts: Math.min(MAX_LIVE_ATTEMPTS, candidates.length) });
 }
 
+function playbackCredit(wall, media, state) {
+  if (state.paused || state.ended || state.seeking || state.readyState < 3 ||
+      wall <= 0 || wall > 2 || media <= 0 || media > wall * 1.5 + 0.1) return 0;
+  return Math.min(wall, media);
+}
+
+function installPlaybackMeter() {
+  const video = document.querySelector('video');
+  if (!video) throw new Error('实播 video 不存在');
+  const state = { valid: 0, started: performance.now(), previousAt: performance.now(), previousTime: video.currentTime };
+  const reset = () => { state.previousAt = performance.now(); state.previousTime = video.currentTime; };
+  video.addEventListener('timeupdate', () => {
+    const now = performance.now();
+    state.valid += playbackCredit((now - state.previousAt) / 1000, video.currentTime - state.previousTime, video);
+    reset();
+  });
+  for (const type of ['playing', 'waiting', 'seeking', 'seeked', 'pause', 'ended']) video.addEventListener(type, reset);
+  // B 站 MSE 播放器不认 video.loop：短视频/分 P 播完会停在结尾。只在「播完」时事件驱动重播，
+  // 不刷新文档、不 mock 媒体状态；重播的 seek 跳跃由 playbackCredit 排除，不计入有效时长。
+  state.replays = 0;
+  const replay = () => {
+    if (!(video.ended || (video.duration && video.duration - video.currentTime < 1.5))) return;
+    state.replays++;
+    try { if (typeof window.player?.seek === 'function') window.player.seek(0); else video.currentTime = 0; }
+    catch (e) { video.currentTime = 0; }
+    video.play().catch(() => {});
+  };
+  video.addEventListener('ended', replay);
+  video.addEventListener('pause', () => setTimeout(replay, 0));
+  video.muted = true;
+  video.loop = true;
+  video.playbackRate = 1;
+  window.__qaPlayback = { snapshot: () => ({ valid: state.valid, wall: (performance.now() - state.started) / 1000,
+    currentTime: video.currentTime, paused: video.paused, readyState: video.readyState, replays: state.replays,
+    sameVideo: document.querySelector('video') === video }) };
+  return video.play();
+}
+
+const RESOURCE_PRESSURE_PRELUDE = String.raw`
+  history.replaceState({}, '', '/video/BV1QARES');
+  localStorage.setItem('bhw_hud', 'false'); localStorage.setItem('biliCdnHud', 'off');
+  MediaSource.prototype.addSourceBuffer = function() { return {}; };
+  const qaDecodingInfo = navigator.mediaCapabilities.decodingInfo.bind(navigator.mediaCapabilities);
+  window.__qaCodecResolvers = [];
+  Object.defineProperty(navigator.mediaCapabilities, 'decodingInfo', { configurable: true, value(config) {
+    if (/av01/i.test(config?.video?.contentType || '')) return qaDecodingInfo(config);
+    return new Promise(resolve => window.__qaCodecResolvers.push(resolve));
+  } });
+  window.__qaStreams = [];
+  const qaFetch = window.fetch;
+  window.fetch = function(input, init) {
+    const url = String(typeof input === 'string' ? input : input.url);
+    if (!url.includes('/qa-resource/')) return qaFetch.call(this, input, init);
+    if (url.includes('stalled') && init?.cache !== 'no-store') {
+      return Promise.resolve(new Response(new ReadableStream({ start(controller) {
+        controller.enqueue(new Uint8Array(65536)); window.__qaStreams.push(controller);
+      } }), { status: 200 }));
+    }
+    return Promise.resolve(new Response(new Uint8Array(65536), { status: 200 }));
+  };
+`;
+
+async function runResourceTests() {
+  await runScenario('资源计数器自测', async cdp => {
+    await navigate(cdp, 'https://www.bilibili.com/robots.txt?qa_resource_counter');
+    const before = await cdp.eval('window.__qaResourceAudit.snapshot()');
+    const audit = await cdp.eval(String.raw`(async () => {
+      const qa = window.__qaResourceAudit;
+      const target = new EventTarget(); const listener = () => {};
+      const timer = setTimeout(() => {}, 100000); const interval = setInterval(() => {}, 100000);
+      target.addEventListener('test', listener); target.addEventListener('test', listener);
+      const once = () => {}; target.addEventListener('once', once, { once: true });
+      const signal = new AbortController(); target.addEventListener('abort-test', listener, { signal: signal.signal });
+      const observer = new MutationObserver(() => {});
+      observer.observe(document, { childList: true }); observer.observe(document, { childList: true });
+      const active = qa.snapshot();
+      target.dispatchEvent(new Event('once')); signal.abort(); observer.disconnect();
+      target.removeEventListener('test', listener); clearTimeout(timer); clearInterval(interval);
+      await new Promise(resolve => setTimeout(resolve, 0));
+      const released = qa.snapshot();
+      const fired = setTimeout(() => {}, 0); await new Promise(resolve => setTimeout(resolve, 10));
+      return { active, released, firedReleased: qa.snapshot() };
+    })()
+    //# sourceURL=bili-boost-qa-fixture.js`, true);
+    const foreign = await cdp.eval(String.raw`(() => {
+      const timer = setTimeout(() => {}, 100000); const observer = new MutationObserver(() => {});
+      observer.observe(document, { childList: true });
+      const value = window.__qaResourceAudit.snapshot(); clearTimeout(timer); observer.disconnect(); return value;
+    })()`);
+    const pass = audit.active.timeouts === 1 && audit.active.intervals === 1 && audit.active.listeners === 3 &&
+      audit.active.mutationObservers === 1 && !resourceBounded(audit.active, RESOURCE_STEADY) &&
+      [audit.released, audit.firedReleased, foreign].every(state => Object.keys(RESOURCE_LIMITS).every(key => state[key] === before[key]));
+    addResult('资源计数器自测', pass ? 'PASS' : 'FAIL', { reason: JSON.stringify({ before, ...audit, foreign }) });
+  }, { inject: false });
+  const creditTests = [
+    playbackCredit(1, 1, { paused: false, ended: false, seeking: false, readyState: 4 }) === 1,
+    ...['paused', 'ended', 'seeking'].map(key => playbackCredit(1, 1, { [key]: true, readyState: 4 }) === 0),
+    playbackCredit(1, 0, { readyState: 4 }) === 0,
+    playbackCredit(1, 100, { readyState: 4 }) === 0,
+    playbackCredit(7200, 1, { readyState: 4 }) === 0,
+  ];
+  addResult('实播时长拒绝空等和跳跃', creditTests.every(Boolean) ? 'PASS' : 'FAIL');
+
+  for (const capability of [false, true]) {
+    for (const kind of ['XHR', 'fetch', 'HUD', 'metadata', 'SPA']) {
+      const name = `资源压力 ${kind}（${capability ? '有' : '无'} AV1 硬解）`;
+      await runScenario(name, async cdp => {
+        await navigate(cdp, `https://www.bilibili.com/robots.txt?qa_resources=${kind}`);
+        await cdp.eval(String.raw`(() => {
+          const video = document.createElement('video'); document.body.appendChild(video);
+          Object.defineProperties(video, {
+            paused: { get: () => ${JSON.stringify(kind === 'HUD')} }, videoWidth: { get: () => 0 },
+            buffered: { get: () => ({ length: 0 }) }
+          });
+          window.__qaResourceVideo = video;
+        })()`);
+        await cdp.send('HeapProfiler.collectGarbage');
+        const before = await cdp.eval('window.__qaResourceAudit.resetPeak()');
+        let off;
+        if (kind === 'XHR') {
+          off = cdp.on('Fetch.requestPaused', async event => {
+            try {
+              if (event.request.url.includes('case=error')) await cdp.send('Fetch.failRequest', { requestId: event.requestId, errorReason: 'Failed' });
+              else await cdp.send('Fetch.fulfillRequest', { requestId: event.requestId, responseCode: 200,
+                responseHeaders: [{ name: 'Access-Control-Allow-Origin', value: '*' }], body: Buffer.alloc(65536).toString('base64') });
+            } catch {} // An intentional abort may have already removed this request.
+          });
+          await cdp.send('Fetch.enable', { patterns: [{ urlPattern: '*qa-resource*' }] });
+        }
+        try {
+          const audit = await cdp.eval(String.raw`(async () => {
+            const kind = ${JSON.stringify(kind)};
+            const api = window.__biliBoost; const host = 'upos-sz-mirror08c.bilivideo.com';
+            const url = 'https://' + host + '/qa-resource/segment.m4s';
+            const tick = () => new Promise(resolve => setTimeout(resolve, 0));
+            let verified = 0;
+            if (kind === 'XHR') {
+              const xhr = new XMLHttpRequest();
+              for (const mode of ['success', 'abort', 'error']) for (let i = 0; i < 100; i++) {
+                await new Promise(resolve => {
+                  xhr.open('GET', url + '?case=' + mode);
+                  xhr.addEventListener('loadend', resolve, { once: true }); xhr.send();
+                  if (mode === 'abort') xhr.abort();
+                }); verified++;
+              }
+              window.__qaHeldXHR = xhr;
+            } else if (kind === 'fetch') {
+              const responses = await Promise.all(Array.from({ length: 40 }, () => fetch(url + '?stalled')));
+              await tick();
+              const cap = api.诊断状态.fetchObservers;
+              history.replaceState({}, '', '/robots.txt?reset'); dispatchEvent(new PopStateEvent('popstate'));
+              for (const controller of window.__qaStreams) controller.close();
+              const sizes = await Promise.all(responses.map(response => response.arrayBuffer().then(value => value.byteLength)));
+              window.__qaStreams.length = 0;
+              if (cap !== 32 || sizes.some(size => size !== 65536)) throw new Error('fetch 上限或原 Response 读取失败');
+              verified = sizes.length;
+            } else if (kind === 'HUD') {
+              await fetch(url); await tick();
+              for (let i = 0; i < 100; i++) {
+                api.面板(true); api.重测(); await tick(); api.面板(false); verified++;
+              }
+            } else if (kind === 'metadata') {
+              const source = new MediaSource();
+              for (let i = 0; i < 25; i++) source.addSourceBuffer('video/mp4; codecs="avc1.64001f"');
+              await tick();
+              history.replaceState({}, '', '/video/BV1QARES?p=metadata'); dispatchEvent(new PopStateEvent('popstate'));
+              for (let i = 0; i < 25; i++) source.addSourceBuffer('video/mp4; codecs="avc1.64001f"');
+              await tick(); window.__qaResourceVideo.dispatchEvent(new Event('loadedmetadata')); await tick();
+              history.replaceState({}, '', '/robots.txt?metadata-reset'); dispatchEvent(new PopStateEvent('popstate'));
+              for (const resolve of window.__qaCodecResolvers) resolve({ powerEfficient: true });
+              await tick();
+              if (api.硬解状态 !== '未知') throw new Error('迟到的编码查询污染了新媒体');
+              verified = 50;
+            } else if (kind === 'SPA') {
+              for (let i = 0; i < 50; i++) {
+                history.replaceState({}, '', '/video/BV1QARES?p=' + i); dispatchEvent(new PopStateEvent('popstate'));
+                await fetch('https://' + host + '/qa-resource/spa-' + i + '/segment.m4s'); await tick(); verified++;
+              }
+              history.replaceState({}, '', '/robots.txt?spa-reset'); dispatchEvent(new PopStateEvent('popstate'));
+            }
+            api.面板(false);
+            history.replaceState({}, '', '/robots.txt?final'); dispatchEvent(new PopStateEvent('popstate'));
+            await tick(); await tick();
+            return { verified, active: window.__qaResourceAudit.snapshot(), diagnostic: api.诊断状态 };
+          })()`, true);
+          await cdp.send('HeapProfiler.collectGarbage');
+          const settled = await cdp.eval('window.__qaResourceAudit.snapshot()');
+          const expected = { XHR: 300, fetch: 40, HUD: 100, metadata: 50, SPA: 50 }[kind];
+          const pass = audit.verified === expected && resourceBounded(settled, RESOURCE_STEADY) && resourceBounded(settled.peak);
+          addResult(name, pass ? 'PASS' : 'FAIL', { reason: JSON.stringify({ before, ...audit, settled, limits: RESOURCE_LIMITS }) });
+        } finally {
+          if (off) { off(); await cdp.send('Fetch.disable').catch(() => {}); }
+          await cdp.eval("localStorage.removeItem('bhw_hud'); localStorage.removeItem('biliCdnHud')").catch(() => {});
+        }
+      }, { beforeObserver: RESET_CODEC_AUTO, prelude: codecProbePrelude(capability) + RESOURCE_PRESSURE_PRELUDE });
+    }
+  }
+}
+
+async function runSoak(targets) {
+  if (!SOAK_SECONDS) return;
+  const name = `真实播放资源回归（${SOAK_SECONDS}秒）`;
+  await runScenario(name, async (cdp, attempt) => {
+    const target = targets.ugc[attempt % targets.ugc.length];
+    await navigate(cdp, `https://www.bilibili.com/video/${target.bvid}`);
+    const codec = await waitForCodec(cdp);
+    await cdp.eval('(' + playbackCredit.toString() + ');\nwindow.playbackCredit = ' + playbackCredit.toString() + ';\n(' + installPlaybackMeter.toString() + ')()', true);
+    await cdp.send('HeapProfiler.collectGarbage');
+    await cdp.eval('window.__qaResourceAudit.resetPeak()');
+    const deadline = Date.now() + (SOAK_SECONDS === 7200 ? 8400 : SOAK_SECONDS + 120) * 1000;
+    let next = 0; let samples = 0; let first;
+    let lastValid = -1; let lastProgressAt = Date.now();
+    for (;;) {
+      if (Date.now() > deadline) throw new Error('实播截止：有效播放未达到目标，不能靠空等通过');
+      if (Date.now() - lastProgressAt > SOAK_STALL_MS) throw new Error(`实播停滞超过 ${SOAK_STALL_MS / 1000} 秒：有效播放不再增长`);
+      await cdp.send('HeapProfiler.collectGarbage');
+      const sample = await cdp.eval(`({ playback: window.__qaPlayback.snapshot(), resources: window.__qaResourceAudit.snapshot(), diagnostic: window.__biliBoost.诊断状态 })`);
+      if (!first) first = sample.resources;
+      if (!sample.playback.sameVideo) throw new Error('实播 video 已被替换（页面自动连播/重建播放器），资源样本不再连续');
+      if (sample.playback.valid > lastValid) { lastValid = sample.playback.valid; lastProgressAt = Date.now(); }
+      if (!resourceBounded(sample.resources) || !resourceBounded(sample.resources.peak)) {
+        throw new Error('实播资源超预算：' + JSON.stringify({ sample, limits: RESOURCE_LIMITS }));
+      }
+      const done = sample.playback.valid >= SOAK_SECONDS && sample.playback.wall >= SOAK_SECONDS;
+      if (sample.playback.valid >= next || done) {
+        console.log('[soak] ' + JSON.stringify({ sample: samples++, bvid: target.bvid, av1Hardware: targets.av1Hardware, ...sample, limits: RESOURCE_LIMITS }));
+        next += 60;
+      }
+      if (done) {
+        addResult(name, 'PASS', { codec, reason: JSON.stringify({ samples, baseline: first, final: sample, limits: RESOURCE_LIMITS }) });
+        break;
+      }
+      await sleep(5000);
+    }
+  }, { beforeObserver: codecAutoCacheSetup(targets.av1Hardware) });
+}
+
 async function main() {
   profile = await mkdtemp(join(tmpdir(), 'qa-boost-'));
   chrome = spawn(CHROME, [
@@ -669,6 +1055,8 @@ async function main() {
     codec: `${benchmark.old.ms.toFixed(1)}ms → ${benchmark.fast.ms.toFixed(1)}ms`,
     reason: `${benchmark.ratio.toFixed(2)}x；20 万次混合请求分类（90% 非分片），计数=${benchmark.fast.count}`,
   });
+
+  await runResourceTests();
 
   const ugcUrls = targets.ugc.map(item => `https://www.bilibili.com/video/${item.bvid}`);
   const ugcAttempts = Math.min(MAX_LIVE_ATTEMPTS, ugcUrls.length);
@@ -1426,6 +1814,8 @@ async function main() {
       reason: `${pass ? '' : `AV1 能力分支不符（dash=${response.hasAv1}, support=${response.supportHasAv1}）；`}${action.via}→${action.text}; 顺序=${responseOrder(response).join(', ')}; playurl=${calls.at(-1)}`,
     });
   }, { beforeObserver: actualCodecSetup, attempts: ugcAttempts });
+
+  await runSoak(targets);
 
   await runScenario('HUD 检查', async (cdp, attempt) => {
     await navigate(cdp, ugcUrlFor(attempt));
