@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         哔哩哔哩播放优化（CDN 测速切源 + 强制硬解编码）
 // @namespace    https://github.com/leonjean214/bili-boost
-// @version      1.5.1
+// @version      1.5.2
 // @description  CDN 两阶段多点测速切源，并剔除 AV1、优先 HEVC/H.264，降低海外播放卡顿与软解发热。
 // @author       leonjean214
 // @match        *://*.bilibili.com/*
@@ -22,6 +22,7 @@
   // ---- CDN 配置 ----
   const CANDIDATES = [
     'upos-sz-mirror08c.bilivideo.com',
+    'upos-sz-mirror08h.bilivideo.com',
     'upos-sz-mirrorali.bilivideo.com',
     'upos-sz-mirrorcos.bilivideo.com',
     'upos-sz-mirrorhw.bilivideo.com',
@@ -143,6 +144,9 @@
       }
     }
     r.at = Date.now();
+    // 内存态本身也是公开诊断与后续排序的事实源，不能等整轮测速 finally 落盘时才裁剪。
+    // 新 host 记录完成后立即按最近更新时间维持 32 条上限，避免测速进行中短暂暴露第 33 条。
+    health = normalizeHealth(health);
     healthDirty = true;
   }
   function ratioOf(host) {
@@ -236,7 +240,7 @@
   // 但 B站有同源 iframe（如登录轮询用的 /correspond/），脚本在里面照样会跑，
   // 那里既不是视频页也拦不到分片。HUD 必须只由顶层窗口绘制，
   // 否则 iframe 会画出第二个 HUD，内容是「没拦到分片请求 / 未检测编码」。
-  const SCRIPT_VERSION = 'v1.5.1';   // ⚠️ 改版本时要和文件头的 @version 一起改
+  const SCRIPT_VERSION = 'v1.5.2';   // ⚠️ 改版本时要和文件头的 @version 一起改
 
   const IS_TOP = (() => { try { return window.top === window.self; } catch (e) { return false; } })();
 

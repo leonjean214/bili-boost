@@ -10,6 +10,10 @@
 >
 > 仓库原名 `bili-cdn-switcher`，合并后改名为 `bili-boost`。GitHub 会自动重定向旧链接。
 
+### v1.5.2
+
+- 按海外用户反馈，将 `upos-sz-mirror08h.bilivideo.com` 加入 CDN 候选；继续走现有快筛、头部/中段精测（Range 不可用时退回头部）。本轮探测失败不会让它成为新赢家；展开 HUD 可手动试该节点，不保证不同地区都更快。
+
 ### v1.5.1
 
 - Safari 兼容审计（见 `reviews/SAFARI-AUDIT-20260925.md`）：`addSourceBuffer` 钩子改为沿原型链同时覆盖 `MediaSource` / `ManagedMediaSource`，iPhone Safari（只有 ManagedMediaSource）不再因 `MediaSource` 未定义而中断初始化；HUD 补 `-webkit-user-select`。
@@ -275,7 +279,7 @@ __biliBoost.清空主机健康()
 
 | 项 | 默认 | 说明 |
 | --- | --- | --- |
-| `CANDIDATES` | 5 个镜像 | 只合成同族 bilivideo host；原始 host 另行加入 |
+| `CANDIDATES` | 6 个镜像 | 只合成同族 bilivideo host；原始 host 另行加入 |
 | `QUICK_BYTES` | 128KB | 阶段1 每个候选的探测量 |
 | `FULL_BYTES` | 768KB | 阶段2 每源总精测量，均分给头部/中段 |
 | `MID_RANGE_OFFSET` | 1MB | 中段 Range 的起始偏移 |
@@ -312,34 +316,38 @@ __biliBoost.清空主机健康()
 ## 回归测试
 
 ```bash
-node tools/qa-boost.mjs        # 默认端口 9333，可用 BILI_BOOST_QA_PORT 覆盖
+./tools/qa-on-win.sh           # 从 Mac 打包到 Win 桌面会话，运行有窗口静音 Chrome
+node tools/qa-boost.mjs        # 在 macOS 上会自动转交上面的 Win runner
 ```
 
-会起一个独立 profile 的 Chrome，跑完自动清理。当前结果（未登录，M2 / Chrome 152）：
+每次 runner 都使用独立的远端目录、计划任务、压缩包和 CDP 端口，可供并行验收；900 秒内未收到原子退出码文件会回显日志并失败，结束后只清理本次进程与文件。当前结果（未登录，Windows RTX 5090）：
 
 ```
-PASS     对照组（不注入）          av01... / powerEfficient=false
+PASS     对照组（不注入）          av01... / 实测 AV1 powerEfficient
 PASS     编码三态向后兼容           true / false / auto+null
 PASS     健康档案旧数据迁移与双上限  v1→v2；32 条 / 7 天裁剪
 PASS     AV1 硬解缓存过期           31 天旧值失效并写回新元数据
-PASS     普通 UGC 视频页            hvc1... / powerEfficient=true
+PASS     普通 UGC 视频页            按实测能力保留 AV1 或改选 HEVC/AVC
 PASS     CDN 模块                   头部+中段、TTFB、手选/自动 API
+PASS ×2  新增 CDN 候选              08h 可用才自动/手动选，不可用退回原始源
 PASS     fetch 实测速与卡顿过滤      Response 语义不变；初始/seek/瞬时 waiting 不误判
-PASS     分片热路径微基准           54.3ms → 14.5ms（3.73×）
-PASS     长时播放与媒体切换有界      2000 分片 + 20 次 SPA + 切清晰度/分 P
+PASS     分片热路径微基准           20 万次分类计数一致
+PASS ×2  长时播放与媒体切换有界      有/无 AV1 硬解；2000 分片 + 20 次 SPA
 PASS     防重复注入                 四个 hook 均未再次包装
+PASS     Safari 仅 ManagedMediaSource  iPhone API 形态可完整初始化
+PASS     Safari 双全局共享原型去重     两个构造器共用的 hook 只包装一次
 PASS ×2  旧版冲突检测               两种注入顺序
-PASS     playurl 劫持层（mock）      fetch / XHR text / XHR json
-PASS     番剧页                     avc1... / powerEfficient=true
-PASS     HUD 检查                   🟢 硬解 · HEVC/H.265
+PASS ×2  playurl 劫持层（mock）      有硬解保留 AV1；无硬解三通道清除 AV1
+PASS     番剧页                     有硬解不干预；无硬解禁止 AV1
+PASS     HUD 检查                   实测能力、编码和 auto 策略一致
 SKIPPED  多 P 视频切 P              未登录流已内联，无 playurl 请求
 SKIPPED  切清晰度                   同上
-总计：PASS=15 FAIL=0 SKIPPED=2
+总计：PASS=21 FAIL=0 SKIPPED=2
 ```
 
-**对照组是最有价值的一条**：不注入脚本时拿到的是 `av01` 且 `powerEfficient=false`，反证了测试本身有区分度。
+**对照组是最有价值的一条**：不注入脚本时必须拿到 `av01`，并以 `powerEfficient` 的实际结果冻结本机能力分支。测试器在每个候选文档的 Observer 运行前清除编码偏好；只有“干净对照选择 AV1、注入后按实测能力保留 AV1 或改选 HEVC/AVC”的视频才进入场景池。后续外部 UGC/番剧场景遇到导航、网络或 CDP 瞬态错误时，会换全新页面和下一个已验证候选，最多三次，不放宽业务断言。
 
-播放器在未登录时不会发 playurl，所以编码模块的第 3/4 层用 CDP `Fetch` mock 一个含「两档清晰度 × 三种编码」的响应来确定性验证，不依赖 B 站的真实行为。多 P 与切清晰度的真实 UI 用例仍会尝试执行；未登录页面不发新请求时，另有确定性模拟验证 20 次 SPA、`cid`（分 P）及 `qn/fnval`（清晰度）变化都会重置媒体态。
+播放器在未登录时不会发 playurl，所以编码模块的第 3/4 层用 CDP `Fetch` mock 一个含「两档清晰度 × 三种编码」的响应来确定性验证，不依赖 B 站的真实行为。mock 与长时资源用例都分别模拟“有 AV1 硬解”和“无 AV1 硬解”：前者验证 `auto` 原样保留 AV1，后者验证 fetch、XHR text、XHR json 与 `support_formats` 均清除 AV1；资源上限和 `cid/qn/fnval` 状态隔离在两个分支都执行。番剧页没有“服务端一定选择 AV1”的候选前置：有硬解时 AV1/HEVC/AVC 都可接受，但必须处于 `auto` 不干预；无硬解时只允许 HEVC/AVC 且必须显示剔除 AV1。多 P 与切清晰度的真实 UI 用例仍会尝试执行；未登录页面不发新请求或有界发现未找到可播放多 P 时会如实 SKIPPED。
 
 ---
 
