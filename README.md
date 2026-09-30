@@ -10,6 +10,11 @@
 >
 > 仓库原名 `bili-cdn-switcher`，合并后改名为 `bili-boost`。GitHub 会自动重定向旧链接。
 
+### v1.6.0
+
+- 关闭 HUD 会清除折叠定时器和点击监听；重复编码状态查询会合并，媒体切换立即结束旧 metadata/能力等待；精测缓冲等待改为事件唤醒并可取消。
+- 新增独立资源计数与有/无 AV1 硬解的压力回归，并提供真实两小时播放检查。发布变更见 [CHANGELOG](CHANGELOG.md)，复现命令与计数口径见下方「回归测试」。
+
 ### v1.5.2
 
 - 按海外用户反馈，将 `upos-sz-mirror08h.bilivideo.com` 加入 CDN 候选；继续走现有快筛、头部/中段精测（Range 不可用时退回头部）。本轮探测失败不会让它成为新赢家；展开 HUD 可手动试该节点，不保证不同地区都更快。
@@ -317,10 +322,17 @@ __biliBoost.清空主机健康()
 
 ```bash
 ./tools/qa-on-win.sh           # 从 Mac 打包到 Win 桌面会话，运行有窗口静音 Chrome
-node tools/qa-boost.mjs        # 在 macOS 上会自动转交上面的 Win runner
+QA_ARGS='--soak-seconds=60' ./tools/qa-on-win.sh  # 完整 QA + 一分钟实播 smoke
+QA_TIMEOUT_SECONDS=9000 QA_ARGS='--soak-seconds=7200' ./tools/qa-on-win.sh  # 完整 QA + 两小时实播
 ```
 
-每次 runner 都使用独立的远端目录、计划任务、压缩包和 CDP 端口，可供并行验收；900 秒内未收到原子退出码文件会回显日志并失败，结束后只清理本次进程与文件。当前结果（未登录，Windows RTX 5090）：
+`--soak-seconds` 仅接受 1..7200 的整数；不传时保持快速完整 QA，不自动等待两小时。长测沿用同一页面的真实视频循环播放、实际 AV1 能力分支、有窗口静音 Chrome，不刷新文档清空资源。只累计媒体时间正常前进的有效播放时长，暂停、卡住、seek 跳跃不计；B 站 MSE 播放器不认 `video.loop`，短视频/分 P 播完时由事件驱动重播（重播的 seek 不计时），有效播放连续 5 分钟不增长或 video 被替换即判 FAIL；有效播放与墙钟均达到目标才 PASS，两小时场景 8400 秒截止，外层 runner 显式给 9000 秒预算。失败/断连/停播或资源超预算返回非零退出码，不能把缺少成功退出码的运行当成完成。
+
+QA 在 userscript 前安装资源计数器，通过合成源码的行区间和**直接资源申请调用点**归属排除 B 站页面、测试器和被脚本调用的外部助手。记录实际活动 timeout/interval、事件监听（含去重、once、AbortSignal 清理）和已 observe 未 disconnect 的 MutationObserver；WeakMap/WeakRef 避免跟踪器强持有废弃 DOM/XHR，采样前 GC 后读取，峰值也在申请时累计。原 `诊断状态` 仅作为另一份业务状态证据，不替代底层资源计数。
+
+冻结的测试上限为 timeout **48**（fetch 32、单代探测最多 7、七项单例等待/展示定时器、两个收尾位置）、interval **1**、监听 **32**（基础 12、空闲等待 4、metadata 1、最多 7 路 XHR 各 2、DOMContentLoaded 1）、MutationObserver **0**。有限压力操作结束并关闭 HUD 后，稳态须回到 timeout 0、interval 1、监听 11、observer 0；不因失败提高预算。实播每分钟有效播放输出一个 `[soak]` JSON 摘要，含墙钟/有效时长、进度、基线/峰值/末值和预算；原始日志只保存在本机，PR 提供无凭据的数字摘要。
+
+每次 runner 都使用独立的远端目录、计划任务、压缩包和 CDP 端口，可供并行验收；900 秒内未收到原子退出码文件会回显日志并失败，结束后只清理本次进程与文件。测试矩阵（未登录，Windows RTX 5090；本轮执行数字与长测证据见 PR）：
 
 ```
 PASS     对照组（不注入）          av01... / 实测 AV1 powerEfficient
@@ -340,9 +352,13 @@ PASS ×2  旧版冲突检测               两种注入顺序
 PASS ×2  playurl 劫持层（mock）      有硬解保留 AV1；无硬解三通道清除 AV1
 PASS     番剧页                     有硬解不干预；无硬解禁止 AV1
 PASS     HUD 检查                   实测能力、编码和 auto 策略一致
+PASS     资源计数器自测             四类资源创建/释放、故意泄漏检出、外部资源排除
+PASS     实播计时反例               暂停/停播/seek/空等不能累计有效播放
+PASS ×10 资源压力双能力矩阵         XHR 300 次、fetch 40 路、HUD 100 次、编码/SPA 各 50 次
 SKIPPED  多 P 视频切 P              未登录流已内联，无 playurl 请求
 SKIPPED  切清晰度                   同上
-总计：PASS=21 FAIL=0 SKIPPED=2
+默认完整 QA：PASS=33 FAIL=0 SKIPPED=2
+带实播场景：另增加一项真实播放资源回归（所选秒数）
 ```
 
 **对照组是最有价值的一条**：不注入脚本时必须拿到 `av01`，并以 `powerEfficient` 的实际结果冻结本机能力分支。测试器在每个候选文档的 Observer 运行前清除编码偏好；只有“干净对照选择 AV1、注入后按实测能力保留 AV1 或改选 HEVC/AVC”的视频才进入场景池。后续外部 UGC/番剧场景遇到导航、网络或 CDP 瞬态错误时，会换全新页面和下一个已验证候选，最多三次，不放宽业务断言。

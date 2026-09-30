@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         哔哩哔哩播放优化（CDN 测速切源 + 强制硬解编码）
 // @namespace    https://github.com/leonjean214/bili-boost
-// @version      1.5.2
+// @version      1.6.0
 // @description  CDN 两阶段多点测速切源，并剔除 AV1、优先 HEVC/H.264，降低海外播放卡顿与软解发热。
 // @author       leonjean214
 // @match        *://*.bilibili.com/*
@@ -184,21 +184,33 @@
   // 等缓冲充足或暂停再测；代次变化或等待期间真卡顿时立即停止等待。
   function waitForIdle(maxWait, shouldStop) {
     return new Promise(resolve => {
-      const deadline = Date.now() + maxWait;
+      const v = document.querySelector('video');
+      const events = ['progress', 'timeupdate', 'pause', 'emptied'];
+      let timer;
+      let finished = false;
+      const done = () => {
+        if (finished) return;
+        finished = true;
+        clearTimeout(timer);
+        for (const type of events) v?.removeEventListener(type, check);
+        if (cdnState.idleWaitCancel === done) cdnState.idleWaitCancel = null;
+        resolve();
+      };
       const check = () => {
-        try { if (shouldStop && shouldStop()) return resolve(); } catch (e) { return resolve(); }
-        const v = document.querySelector('video');
-        if (!v || v.paused) return resolve();
+        try { if (shouldStop && shouldStop()) return done(); } catch (e) { return done(); }
+        if (!v || v.paused) return done();
         try {
           const b = v.buffered;
           for (let i = 0; i < b.length; i++) {
             if (b.start(i) <= v.currentTime + 0.25 && b.end(i) >= v.currentTime &&
-                b.end(i) - v.currentTime >= IDLE_BUFFER_SEC) return resolve();
+                b.end(i) - v.currentTime >= IDLE_BUFFER_SEC) return done();
           }
-        } catch (e) { return resolve(); }
-        if (Date.now() >= deadline) return resolve();
-        setTimeout(check, 500);
+        } catch (e) { return done(); }
       };
+      cdnState.idleWaitCancel?.();
+      cdnState.idleWaitCancel = done;
+      for (const type of events) v?.addEventListener(type, check);
+      timer = setTimeout(done, maxWait);
       check();
     });
   }
@@ -240,7 +252,7 @@
   // 但 B站有同源 iframe（如登录轮询用的 /correspond/），脚本在里面照样会跑，
   // 那里既不是视频页也拦不到分片。HUD 必须只由顶层窗口绘制，
   // 否则 iframe 会画出第二个 HUD，内容是「没拦到分片请求 / 未检测编码」。
-  const SCRIPT_VERSION = 'v1.5.2';   // ⚠️ 改版本时要和文件头的 @version 一起改
+  const SCRIPT_VERSION = 'v1.6.0';   // ⚠️ 改版本时要和文件头的 @version 一起改
 
   const IS_TOP = (() => { try { return window.top === window.self; } catch (e) { return false; } })();
 
@@ -274,8 +286,9 @@
     warningTimer: null,
     activeProbeControllers: new Set(),
     fetchObservers: new Set(),
+    idleWaitCancel: null,
   };
-  const codecState = { stripped: 0, picked: null, offered: [], efficient: null };
+  const codecState = { stripped: 0, picked: null, offered: [], efficient: null, statusPending: null };
   const playbackState = {
     video: null,
     hasAdvanced: false,
@@ -471,6 +484,8 @@
   // 只清媒体态；全局赢家、黑名单和带 TTL 的缓存仍保持原脚本语义。
   function resetMediaState(reason, nextId = mediaIdentity()) {
     mediaGeneration++;
+    cdnState.idleWaitCancel?.();
+    codecState.statusPending?.cancel();
     lastPlayRequestId = null;
     if (cdnState.warningTimer) {
       clearTimeout(cdnState.warningTimer);
@@ -1134,37 +1149,53 @@
     if (!codecState.picked) return;
     const generation = mediaGeneration;
     const picked = codecState.picked;
+    const previous = codecState.statusPending;
+    if (previous?.generation === generation && previous.picked === picked && !previous.cancelled) return;
+    previous?.cancel();
+    const task = { generation, picked, cancelled: false, cancel: () => { task.cancelled = true; } };
+    codecState.statusPending = task;
     const video = document.querySelector('video');
-    if (video && !video.videoWidth) {
-      await new Promise(resolve => {
-        let timer;
-        const done = () => {
-          clearTimeout(timer);
-          video.removeEventListener('loadedmetadata', done);
-          resolve();
-        };
-        video.addEventListener('loadedmetadata', done, { once: true });
-        timer = setTimeout(done, 1500);
-      });
-    }
-
-    let efficient = null;
     try {
-      const info = await withTimeout(navigator.mediaCapabilities.decodingInfo({
-        type: 'media-source',
-        video: {
-          contentType: picked,
-          width: video?.videoWidth || 1920,
-          height: video?.videoHeight || 1080,
-          bitrate: 4000000,
-          framerate: 30,
-        },
-      }), DECODING_INFO_TIMEOUT);
-      efficient = info.powerEfficient;
-    } catch (e) { /* 查询失败必须保持“未知”，不能按编码名猜 */ }
-    if (generation !== mediaGeneration || picked !== codecState.picked) return;
-    codecState.efficient = efficient;
-    renderHud(false);
+      if (video && !video.videoWidth) {
+        await new Promise(resolve => {
+          let timer;
+          const done = () => {
+            clearTimeout(timer);
+            video.removeEventListener('loadedmetadata', done);
+            resolve();
+          };
+          task.cancel = () => { task.cancelled = true; done(); };
+          video.addEventListener('loadedmetadata', done, { once: true });
+          timer = setTimeout(done, 1500);
+        });
+      }
+      if (task.cancelled) return;
+      // The capability promise cannot be aborted; cancel our wait and ignore its late result.
+      const efficient = await new Promise(resolve => {
+        let settled = false;
+        let timer;
+        const done = value => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolve(value);
+        };
+        task.cancel = () => { task.cancelled = true; done(null); };
+        timer = setTimeout(() => done(null), DECODING_INFO_TIMEOUT);
+        try {
+          Promise.resolve(navigator.mediaCapabilities.decodingInfo({
+            type: 'media-source',
+            video: { contentType: picked, width: video?.videoWidth || 1920,
+              height: video?.videoHeight || 1080, bitrate: 4000000, framerate: 30 },
+          })).then(info => done(typeof info.powerEfficient === 'boolean' ? info.powerEfficient : null), () => done(null));
+        } catch (e) { done(null); }
+      });
+      if (task.cancelled || generation !== mediaGeneration || picked !== codecState.picked) return;
+      codecState.efficient = efficient;
+      renderHud(false);
+    } finally {
+      if (codecState.statusPending === task) codecState.statusPending = null;
+    }
   }
 
   // ---- 播放闭环：事件先去误报，再确认真卡顿 ----
@@ -1203,6 +1234,7 @@
     if (now - playbackState.lastConfirmedAt < STALL_DEDUP_MS) return;
     playbackState.lastConfirmedAt = now;
     cdnState.stalls++;
+    cdnState.idleWaitCancel?.();
     renderHud(false);
     if (!current || now - cdnState.lastRetest < RETEST_COOLDOWN) return;
     cdnState.lastRetest = now;
@@ -1309,8 +1341,14 @@
     hudOn = on !== false;
     configSet('hud', hudOn);
     try { localStorage.setItem('biliCdnHud', hudOn ? 'on' : 'off'); } catch (e) { }
-    if (!hudOn) document.getElementById('bili-boost-hud')?.remove();
-    else renderHud(false);
+    if (!hudOn) {
+      const box = document.getElementById('bili-boost-hud');
+      if (box) {
+        clearTimeout(box.__collapseTimer);
+        box.removeEventListener('click', box.__onClick);
+        box.remove();
+      }
+    } else renderHud(false);
     return hudOn;
   }
 
@@ -1329,7 +1367,7 @@
       'box-shadow:0 3px 14px rgba(0,0,0,.5);white-space:pre;transition:opacity .4s;cursor:pointer;' +
       // Safari 至今只认带前缀的 -webkit-user-select（MDN BCD），否则连点 HUD 会选中文字。
       '-webkit-user-select:none;user-select:none';
-    box.addEventListener('click', event => {
+    box.__onClick = event => {
       const actionNode = event.target.closest('[data-action]');
       const action = actionNode?.dataset.action;
       if (action === 'source') {
@@ -1364,7 +1402,8 @@
       }
       hudExpanded = !hudExpanded;
       renderHud(false);
-    });
+    };
+    box.addEventListener('click', box.__onClick);
     document.body.appendChild(box);
     return box;
   }
