@@ -1056,6 +1056,20 @@ async function main() {
     reason: `${benchmark.ratio.toFixed(2)}x；20 万次混合请求分类（90% 非分片），计数=${benchmark.fast.count}`,
   });
 
+  // v1.7.0 卡顿优化（测速代表性 / 防横跳 / 缓冲不足禁测 / 码率 / 编码判定）的模拟回归，
+  // 不开浏览器、不联网；单独运行：node tools/qa-stall.mjs
+  try {
+    const output = execFileSync(process.execPath, [fileURLToPath(new URL('./qa-stall.mjs', import.meta.url))], {
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 120_000,
+    });
+    addResult('卡顿优化模拟回归（qa-stall）', 'PASS', { reason: output.trim().split('\n').at(-1) });
+  } catch (error) {
+    const output = String(error.stdout || '') + String(error.stderr || '');
+    addResult('卡顿优化模拟回归（qa-stall）', 'FAIL', {
+      reason: output.split('\n').filter(line => /^FAIL|===/.test(line)).join('；') || error.message,
+    });
+  }
+
   await runResourceTests();
 
   const ugcUrls = targets.ugc.map(item => `https://www.bilibili.com/video/${item.bvid}`);
@@ -1176,6 +1190,12 @@ async function main() {
       if (!api?.测速结果) return null;
       const list = api.测速结果.list || [];
       const precise = list.find(item => item.ok === true && Array.isArray(item.points) && item.points.length > 1);
+      // v1.7.0：播放中缓冲 <15 秒不做精测，开播那轮可能只有快筛；没有精测结果时手动重测一次
+      // （手动不受缓冲门控），等到出现精测条目再断言。
+      if (!precise) {
+        if (!window.__qaCdnRetested && api.诊断状态.probing === 0) { window.__qaCdnRetested = true; api.重测(); }
+        return null;
+      }
       const choice = list.find(item => item.ok === true);
       const source = api.当前源;
       let manualOk = false;
@@ -1192,10 +1212,10 @@ async function main() {
         source,
         speed: api.实测速度,
         timingOk: !!precise && Number.isFinite(precise.ttfb) &&
-          precise.points.some(point => point.point === '中'),
+          precise.points.some(point => point.point === '中' || point.point === '前方'),
         manualOk
       };
-    })()`), { timeout: 55_000, interval: 500, label: 'CDN 两阶段多点测速结果' });
+    })()`), { timeout: 90_000, interval: 500, label: 'CDN 两阶段多点测速结果' });
     const healthBound = await cdp.eval(String.raw`(() => {
       clearInterval(window.__qaHealthWatch);
       return {
