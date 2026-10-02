@@ -1123,8 +1123,20 @@
   }
 
   // 按分片路径对上 playurl 的流：得到当前码率，并在 SourceBuffer 钩子拿不到时推断编码。
+  // Safari/Userscripts 下页面内联的 __playinfo__ 可能早于注入（setter 钩子错过），换分 P 时也可能整体换新对象：
+  // 分片对不上时按需从页面当前的 __playinfo__ 重建索引，每个对象只重建一次。
+  let indexedPlayinfo = null;
+  function reindexFromPagePlayinfo() {
+    let info = null;
+    try { info = window.__playinfo__; } catch (e) { }
+    if (!info || typeof info !== 'object' || info === indexedPlayinfo) return false;
+    indexedPlayinfo = info;
+    notePlayinfoBitrates(info);
+    return true;
+  }
   function noteTrack(url) {
-    const entry = bitrateState.byPath.get(url.pathname);
+    let entry = bitrateState.byPath.get(url.pathname);
+    if (!entry && reindexFromPagePlayinfo()) entry = bitrateState.byPath.get(url.pathname);
     if (!entry) return;
     if (entry.kind === 'video') {
       bitrateState.videoPath = url.pathname;
