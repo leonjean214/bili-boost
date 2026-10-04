@@ -382,7 +382,7 @@ function createPage(model, { hud = true, mediaCapabilities = 'safari', source = 
   const hudText = () => elements.get('bili-boost-hud')?.textContent || '';
 
   return { clock, net, api, sandbox, logs, setPlayinfo, attachVideo, startPlayback, stopPlayback, requestSegment,
-    player, bufferAhead, hudText, get video() { return video; } };
+    player, bufferAhead, hudText, get hud() { return elements.get('bili-boost-hud') || null; }, get video() { return video; } };
 }
 
 // 现场 cosov：头部 2MB 内命中 CDN 缓存（几十 MB/s），之后回源只有 ~120KB/s。
@@ -701,6 +701,72 @@ async function scenarioBanRecovery() {
   check('6 黑名单有界（≤64）', state.blacklist <= 64, `blacklist=${state.blacklist}`);
 }
 
+// 诊断 JSON：内容与 HUD/debug 一致、剥掉签名查询串、有界、复制走剪贴板且失败有兜底、不留定时器。
+async function scenarioDiagnostics() {
+  const page = createPage(FORBIDDEN_MODEL, { hud: true });
+  page.sandbox.location.search = '?p=9&vd_source=SECRET_VD';
+  page.sandbox.navigator.userAgent = 'QA-Safari https://upos-sz-mirror08c.bilivideo.com/x.m4s?upsig=SECRET_SIG&mid=SECRET_MID';
+  page.setPlayinfo();
+  page.startPlayback({ host: H('cosov') });
+  await page.clock.advance(90_000);
+  page.stopPlayback();
+  await page.clock.advance(15_000);
+  const api = page.api;
+  const report = api.诊断报告;
+  const text = JSON.stringify(report);
+  check('7 诊断报告字段齐全且与 debug 一致', report.格式 === 'bili-boost-diag/1' && /^v\d/.test(report.版本) &&
+    report.当前源 === api.当前源 && report.卡顿次数 === api.卡顿次数 && report.页面.分P === '9' &&
+    report.页面.路径 === '/video/BV1PF4m177EQ/' && report.切源记录.length === api.切源记录.length &&
+    report.切源记录.every(item => /^\d{4}-\d\d-\d\dT/.test(item.at)) &&
+    report.黑名单详情.some(item => item.host === H('08c')) && report.测速结果?.列表?.length > 0 &&
+    Object.keys(report.主机健康).length > 0,
+    `当前源=${report.当前源} 切源=${report.切源记录.length} 测速=${report.测速结果?.列表?.length} 黑名单=${report.黑名单详情.length}`);
+  check('7 不泄露签名/查询参数（upsig、mid、vd_source 等）', !/SECRET_|upsig|[?&]mid=|e=sig/.test(text) &&
+    report.环境.UA.includes('upos-sz-mirror08c.bilivideo.com/x.m4s'), report.环境.UA);
+  check('7 报告有界（≤64KB）', text.length <= 64 * 1024, `${text.length} 字符`);
+
+  // HUD 展开后有「复制诊断 JSON」，点击走 navigator.clipboard，成功后 HUD 给出反馈。
+  let copied = null;
+  page.sandbox.navigator.clipboard = { writeText: value => { copied = value; return Promise.resolve(); } };
+  page.hud.click();                                       // 展开
+  const expanded = /复制诊断 JSON/.test(page.hudText());
+  const timersBefore = page.clock.timers.size;
+  const action = { dataset: { action: 'copy-diag' } };
+  let stopped = false;
+  page.hud.emitLocal('click', { target: { closest: () => action }, stopPropagation() { stopped = true; } });
+  await page.clock.advance(0);
+  let parsed = null;
+  try { parsed = JSON.parse(copied); } catch { }
+  check('7 HUD 一键复制：剪贴板拿到完整 JSON，HUD 显示已复制', expanded && stopped && parsed?.格式 === 'bili-boost-diag/1' &&
+    parsed.当前源 === api.当前源 && /已复制诊断 JSON/.test(page.hudText()),
+    `展开=${expanded} 复制=${copied ? copied.length + ' 字符' : '无'} HUD=${JSON.stringify(page.hudText().split('\n').find(line => /诊断/.test(line)))}`);
+  check('7 复制不新增定时器', page.clock.timers.size === timersBefore, `定时器 ${timersBefore} → ${page.clock.timers.size}`);
+  page.hud.click();                                       // 收起后反馈清掉，再展开不残留旧提示
+  page.hud.click();
+  const cleared = !/已复制/.test(page.hudText()) && /复制诊断 JSON/.test(page.hudText());
+
+  // 剪贴板被拒（Safari 非手势/权限）且没有 execCommand：打印到控制台，返回明确提示。
+  page.sandbox.navigator.clipboard = { writeText: () => Promise.reject(new Error('NotAllowedError')) };
+  const before = page.logs.length;
+  const message = await api.复制诊断();
+  const printed = page.logs.slice(before).some(line => line.includes('bili-boost-diag/1'));
+  delete page.sandbox.navigator.clipboard;
+  const message2 = await api.复制诊断();
+  // 超长兜底：塞一个 200KB 的 UA，导出的仍须是合法 JSON 且 ≤64KB、带「已截断」标记。
+  const realUa = page.sandbox.navigator.userAgent;
+  page.sandbox.navigator.userAgent = 'x'.repeat(200 * 1024);
+  let huge = null;
+  page.sandbox.navigator.clipboard = { writeText: value => { huge = value; return Promise.resolve(); } };
+  await api.复制诊断();
+  page.sandbox.navigator.userAgent = realUa;
+  let hugeParsed = null;
+  try { hugeParsed = JSON.parse(huge); } catch { }
+  check('7 超长时仍输出合法 JSON（≤64KB，标记已截断）', hugeParsed?.已截断 === true && huge.length <= 64 * 1024 &&
+    hugeParsed.当前源 === api.当前源, `${huge?.length} 字符，合法=${!!hugeParsed}`);
+  check('7 剪贴板不可用时打印到控制台并提示（收起/再展开后反馈不残留）', cleared && /已打印到控制台/.test(message) && printed &&
+    /已打印到控制台/.test(message2), `收起清空=${cleared} 控制台=${printed}；${message} / ${message2}`);
+}
+
 async function contrast() {
   let legacy;
   try {
@@ -731,6 +797,7 @@ await scenarioBitrate();
 await scenarioCodec();
 await scenarioSegmentForbidden();
 await scenarioBanRecovery();
+await scenarioDiagnostics();
 if (CONTRAST) await contrast();
 const failed = results.filter(item => !item.pass);
 console.log(`\n=== qa-stall：PASS=${results.length - failed.length} FAIL=${failed.length}，耗时 ${((Date.now() - started) / 1000).toFixed(1)}s ===`);
