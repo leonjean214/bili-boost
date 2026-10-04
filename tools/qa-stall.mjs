@@ -343,7 +343,7 @@ function createPage(model, { hud = true, mediaCapabilities = 'safari', source = 
     const offset = index * SEG_BYTES;
     const xhr = new FakeXHR();
     const host = player.hostFor ? player.hostFor(index) : player.host;
-    xhr.open('GET', `https://${host}${VIDEO_PATH}?e=sig&seg=${index}`);
+    xhr.open('GET', `https://${host}${player.path || VIDEO_PATH}?e=sig&seg=${index}`);
     xhr.setRequestHeader('Range', `bytes=${offset}-${offset + SEG_BYTES - 1}`);
     player.downloading = true;
     xhr.addEventListener('loadend', event => {
@@ -895,6 +895,114 @@ async function scenarioRealPrior() {
     `08c=${JSON.stringify(mh[H('08c')])} ali=${JSON.stringify(mh[H('ali')])} 条数=${Object.keys(mh).length} 旧版=${legacyOk ?? '跳过'}`);
 }
 
+// 场景 9：自动降档后的回升与滞回。多档 playurl（112/80/64/32），模拟播放器 requestQuality 会换分片路径。
+const QUALITY_PATHS = { 112: '/upgcxcode/09/61/1234567/1234567-1-30112.m4s', 80: VIDEO_PATH,
+  64: '/upgcxcode/09/61/1234567/1234567-1-30064.m4s', 32: '/upgcxcode/09/61/1234567/1234567-1-30032.m4s' };
+const QUALITY_BW = { 112: 4_194_304, 80: VIDEO_BANDWIDTH, 64: 1_048_576, 32: 524_288 };
+// 播放器只拉视频分片（脚本没见到音频路径），需求按视频算：80 档 256KB/s（降档门槛 1.2× = 307，回升门槛 1.5× = 384），
+// 64 档 128KB/s（1.2× = 154）。
+function qualityPage() {
+  const net = { bw: 290 };
+  const page = createPage({ speed: () => net.bw }, { hud: true });
+  const video = Object.entries(QUALITY_PATHS).map(([qn, path]) => ({ id: Number(qn), codecid: 12, codecs: 'hev1.1.6.L120.90',
+    bandwidth: QUALITY_BW[qn], width: 1920, height: 1080, frameRate: '30.000', baseUrl: `https://${H('cosov')}${path}?e=sig` }));
+  page.sandbox.__playinfo__ = { code: 0, data: { accept_quality: [112, 80, 64, 32], dash: { video,
+    audio: [{ id: 30280, codecid: 0, codecs: 'mp4a.40.2', bandwidth: AUDIO_BANDWIDTH, baseUrl: `https://${H('cosov')}${AUDIO_PATH}?e=sig` }] } } };
+  const calls = [];
+  const state = { nowQ: 80 };
+  const setQuality = qn => { state.nowQ = qn; page.player.path = QUALITY_PATHS[qn]; };
+  page.sandbox.player = {
+    getQuality: () => ({ nowQ: state.nowQ }),
+    requestQuality: qn => { calls.push({ qn, at: page.clock.now, ahead: page.bufferAhead() }); setQuality(qn); },
+  };
+  page.player.path = QUALITY_PATHS[80];
+  page.api.自动降档(true);
+  return { page, net, calls, setQuality };
+}
+async function advanceUntil(page, ms, done, step = 5_000) {
+  for (let t = 0; t < ms && !done(); t += step) await page.clock.advance(step);
+}
+async function scenarioQualityRestore() {
+  const { page, net, calls } = qualityPage();
+  const qns = () => calls.map(call => call.qn).join('→');
+  page.startPlayback({ host: H('cosov') });
+  await page.clock.advance(60_000);    // 290KB/s：80 档跟不上（<307）→ 降到 64
+  net.bw = 340;                        // 落在滞回带内：够 80 档的 1.2×（307），不够回升门槛 1.5×（384）
+  await page.clock.advance(300_000);
+  check('9 降档后网速落在滞回带内（≥1.2× 但 <1.5× 原档码率）不回升', qns() === '64',
+    `requestQuality=${qns()}；${page.api.码率.说明}`);
+
+  net.bw = 700;
+  await advanceUntil(page, 300_000, () => calls.length >= 2);
+  const down = calls[0];
+  const up = calls[1];
+  check('9 网速恢复后自动升回降档前的清晰度（距降档 ≥2 分钟、前向缓冲 ≥15 秒）',
+    up?.qn === 80 && up.at - down.at >= 120_000 && up.ahead >= 15 && /升回 80/.test(page.hudText() + page.api.码率.说明),
+    `${qns()}，距降档 ${up ? Math.round((up.at - down.at) / 1000) : '-'}s，缓冲 ${up?.ahead?.toFixed(1)}s；${page.api.码率.说明}`);
+
+  net.bw = 200;                        // 回升后当前源连续 3 片 <80 档码率（256）→ 试用期内退回 64，失败计 1 次
+                                       // （其他源还挂着 340 的旧探测值，全局告警不会触发，不能只靠它）
+  await advanceUntil(page, 120_000, () => calls.length >= 3);
+  const revert = calls[2];
+  const plan = page.api.码率.回升;
+  check('9 回升后试用期内跟不上 → 退回原档，失败次数 +1、下次等待翻倍',
+    revert?.qn === 64 && revert.at - up.at < 180_000 && plan?.失败次数 === 1 && plan.等待 === '240 秒' && /退回/.test(page.api.码率.说明),
+    `${qns()}，回升后 ${revert ? Math.round((revert.at - up.at) / 1000) : '-'}s 退回；回升=${JSON.stringify(plan)}`);
+
+  net.bw = 700;
+  const resumeAt = page.clock.now;
+  await advanceUntil(page, 600_000, () => calls.length >= 4);
+  const again = calls[3];
+  check('9 再次回升遵守翻倍后的等待（≥240 秒），不来回横跳',
+    again?.qn === 80 && again.at - revert.at >= 240_000 && again.at - resumeAt < 600_000,
+    `${qns()}，距退回 ${again ? Math.round((again.at - revert.at) / 1000) : '-'}s`);
+
+  await page.clock.advance(240_000);   // 试用期（3 分钟）平安度过 → 回升计划结束
+  check('9 回到降档前清晰度且试用期平安后结束回升；从不超过降档前的档位（不请求 112）',
+    page.api.码率.回升 === null && calls.length === 4 && !calls.some(call => call.qn > 80) && /自动回升结束/.test(page.api.码率.说明),
+    `${qns()}；回升=${JSON.stringify(page.api.码率.回升)}；${page.api.码率.说明}`);
+  page.stopPlayback();
+
+  // 手动改清晰度、关掉开关：都不再自动回升。
+  const manual = qualityPage();
+  manual.page.startPlayback({ host: H('cosov') });
+  await manual.page.clock.advance(120_000);
+  manual.setQuality(32);               // 用户自己切到 32
+  manual.net.bw = 700;
+  await manual.page.clock.advance(400_000);
+  const manualQns = manual.calls.map(call => call.qn).join('→');
+  const off = qualityPage();
+  off.page.startPlayback({ host: H('cosov') });
+  await off.page.clock.advance(120_000);
+  const hadPlan = !!off.page.api.码率.回升;
+  off.page.api.自动降档(false);
+  off.net.bw = 700;
+  await off.page.clock.advance(400_000);
+  check('9 用户手动改清晰度 / 关掉自动降档后，不再自动回升',
+    manualQns === '64' && manual.page.api.码率.回升 === null && /停止自动回升/.test(manual.page.api.码率.说明) &&
+    hadPlan && off.calls.length === 1 && off.page.api.码率.回升 === null,
+    `手动：${manualQns}，${manual.page.api.码率.说明}；关开关：调用 ${off.calls.length} 次，之前有计划=${hadPlan}`);
+  manual.page.stopPlayback();
+  off.page.stopPlayback();
+
+  // 回升后试用期内确认卡顿（不经过码率告警）也退回。
+  const stall = qualityPage();
+  stall.page.startPlayback({ host: H('cosov') });
+  await stall.page.clock.advance(120_000);
+  stall.net.bw = 700;
+  await advanceUntil(stall.page, 300_000, () => stall.calls.length >= 2);
+  const timersBefore = stall.page.clock.timers.size;
+  stall.net.bw = 1;                      // 网络骤停：没有新分片完成（不会触发码率告警），缓冲耗尽 → 确认卡顿
+  await stall.page.clock.advance(45_000);
+  stall.net.bw = 700;
+  await stall.page.clock.advance(5_000);
+  const stallQns = stall.calls.map(call => call.qn).join('→');
+  check('9 回升试用期内确认卡顿 → 立即退回并计失败（不新增定时器）',
+    stallQns === '64→80→64' && stall.page.api.码率.回升?.失败次数 === 1 && stall.page.clock.timers.size <= timersBefore,
+    `${stallQns}，卡顿 ${stall.page.api.卡顿次数} 次，定时器 ${timersBefore} → ${stall.page.clock.timers.size}`);
+  stall.page.stopPlayback();
+}
+
 async function contrast() {
   let legacy;
   try {
@@ -927,6 +1035,7 @@ await scenarioSegmentForbidden();
 await scenarioBanRecovery();
 await scenarioDiagnostics();
 await scenarioRealPrior();
+await scenarioQualityRestore();
 if (CONTRAST) await contrast();
 const failed = results.filter(item => !item.pass);
 console.log(`\n=== qa-stall：PASS=${results.length - failed.length} FAIL=${failed.length}，耗时 ${((Date.now() - started) / 1000).toFixed(1)}s ===`);
