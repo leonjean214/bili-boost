@@ -78,6 +78,13 @@
   const REAL_WEIGHT_FEW = 0.6;       // 有 1~2 片真实数据时真实速度权重
   const REAL_WEIGHT_MANY = 0.8;      // 有 ≥N 片时
   const DOWNGRADE_COOLDOWN = 60e3;
+  // 自动降档后的回升：只回到降档前的清晰度，逐档上调，门槛（1.5×）高于降档门槛（1.2×）形成滞回。
+  const UPGRADE_HEADROOM = 1.5;      // 当前源连续 N 片都 ≥ 目标档码率 × 1.5 才回升
+  const UPGRADE_SEGMENTS = 5;
+  const UPGRADE_QUIET = 120e3;       // 距上次降档/卡顿至少 2 分钟；回升失败一次翻倍，封顶 30 分钟
+  const UPGRADE_QUIET_MAX = 30 * 60e3;
+  const UPGRADE_PROBATION = 180e3;   // 回升后 3 分钟内卡顿或跟不上码率 → 退回并计一次失败
+  const QUALITY_SETTLE_MS = 15e3;    // 请求换档后 15 秒内不判断“清晰度被手动改过”
   const STALL_CONFIRM_MS = 1200;
   const STALL_SEEK_GRACE = 2500;
   const STALL_LOAD_GRACE = 3000;
@@ -389,7 +396,10 @@
   };
   // playurl 里的码率/编码表：按分片路径（跨镜像不变）查当前播放的是哪一路流。
   const bitrateState = { byPath: new Map(), qualities: [], videoPath: null, audioPath: null,
-    warn: null, lastDowngradeAt: 0, downgradeNote: '' };
+    warn: null, lastDowngradeAt: 0, downgradeNote: '',
+    // 自动降档留下的回升计划：{ qn 降档前清晰度, expectQn 脚本最近请求的清晰度, requestedAt, ok 连续达标片数,
+    //   failures 回升失败次数, upgradedAt 最近一次回升时间, from 回升前清晰度 }；没有自动降过档时为 null。
+    restore: null };
   const codecState = { stripped: 0, picked: null, offered: [], efficient: null, statusPending: null,
     inferred: null, reason: '', via: '' };
   const playbackState = {
@@ -1503,7 +1513,7 @@
     if (cdnState.perf.length > PERF_WINDOW) cdnState.perf.shift();
     noteRealSample(request.host, metrics.effectiveKbps);
     recordRealHealth(request.host, metrics.effectiveKbps);
-    checkBitrateHeadroom();
+    if (!checkBitrateHeadroom()) noteRestoreSample(request.host, metrics.effectiveKbps);
     renderHud(false);
   }
 
@@ -1527,37 +1537,126 @@
     const warn = measured > 0 && best < required * BITRATE_HEADROOM;
     bitrateState.warn = warn ? { required, best, hosts: measured, at: Date.now() } : null;
     if (warn && autoDowngrade) maybeDowngrade();
+    return warn;
   }
-  function maybeDowngrade() {
+  function currentQualityQn() {
+    let qn = NaN;
+    try {
+      const quality = window.player?.getQuality?.();
+      qn = Number(quality?.nowQ ?? quality?.realQ ?? quality);
+    } catch (e) { }
+    return Number.isFinite(qn) ? qn : bitrateState.byPath.get(bitrateState.videoPath)?.id;
+  }
+  // 某一档清晰度的需求（KB/s）：优先取与当前流同编码的那一路，加上当前音频。
+  function qualityRequiredKbps(qn) {
+    const current = bitrateState.byPath.get(bitrateState.videoPath);
+    let pick = null;
+    for (const info of bitrateState.byPath.values()) {
+      if (info.kind !== 'video' || info.id !== qn || !info.bandwidth) continue;
+      const same = current && info.codecid === current.codecid;
+      const pickSame = current && pick && pick.codecid === current.codecid;
+      if (!pick || (same && !pickSame) || (same === pickSame && info.bandwidth > pick.bandwidth)) pick = info;
+    }
+    if (!pick) return null;
+    const audio = bitrateState.byPath.get(bitrateState.audioPath);
+    return Math.round((pick.bandwidth + (audio?.bandwidth || 0)) / 8 / 1024);
+  }
+  const restoreQuiet = restore => Math.min(UPGRADE_QUIET_MAX, UPGRADE_QUIET * 2 ** Math.min(8, restore.failures));
+  function maybeDowngrade({ revert = false } = {}) {
     const now = Date.now();
-    if (now - bitrateState.lastDowngradeAt < DOWNGRADE_COOLDOWN) return;
+    if (!revert && now - bitrateState.lastDowngradeAt < DOWNGRADE_COOLDOWN) return;
     bitrateState.lastDowngradeAt = now;
     const player = window.player;
     if (!player || typeof player.requestQuality !== 'function') {
       bitrateState.downgradeNote = '播放器未暴露 requestQuality，无法自动降档';
       return;
     }
-    let currentQn = NaN;
-    try {
-      const quality = player.getQuality?.();
-      currentQn = Number(quality?.nowQ ?? quality?.realQ ?? quality);
-    } catch (e) { }
-    if (!Number.isFinite(currentQn)) currentQn = bitrateState.byPath.get(bitrateState.videoPath)?.id;
-    const lower = bitrateState.qualities.find(qn => qn < currentQn);
+    const currentQn = currentQualityQn();
+    const restore = bitrateState.restore;
+    // 回升后试用期内跟不上：退回回升前那一档（不是再降一档），并把下次回升的等待时间翻倍。
+    const probation = restore?.upgradedAt && now - restore.upgradedAt < UPGRADE_PROBATION;
+    const lower = probation && restore.from < currentQn ? restore.from : bitrateState.qualities.find(qn => qn < currentQn);
     if (!lower) {
       bitrateState.downgradeNote = '已是最低一档';
       return;
     }
     try {
       player.requestQuality(lower);
-      bitrateState.downgradeNote = `已自动从 ${currentQn} 降到 ${lower}`;
-      console.warn('[bili-boost] 所有源都跟不上码率，自动降一档：', currentQn, '→', lower);
     } catch (e) {
       bitrateState.downgradeNote = '降档调用失败：' + (e?.message || e);
+      return;
     }
+    const plan = restore || { qn: currentQn, failures: 0 };
+    if (probation) plan.failures++;
+    Object.assign(plan, { expectQn: lower, requestedAt: now, ok: 0, upgradedAt: 0, from: null });
+    bitrateState.restore = plan;
+    bitrateState.downgradeNote = `已自动从 ${currentQn} 降到 ${lower}` + (probation ? '（回升后跟不上，退回）' : '') +
+      `；网速恢复后自动回升（连续 ${UPGRADE_SEGMENTS} 片 ≥ ${UPGRADE_HEADROOM}×目标码率，至少等 ${Math.round(restoreQuiet(plan) / 60e3)} 分钟）`;
+    console.warn('[bili-boost] 所有源都跟不上码率，自动降一档：', currentQn, '→', lower, probation ? '（回升失败退回）' : '');
+  }
+  // 每片真实分片（且当前没有码率告警）都判断一次是否够回升；达标片数在卡顿/换档/换源后重新计。
+  function noteRestoreSample(host, effectiveKbps) {
+    const restore = bitrateState.restore;
+    if (!restore || !autoDowngrade) return;
+    const now = Date.now();
+    const current = currentQualityQn();
+    if (Number.isFinite(current) && current !== restore.expectQn && now - restore.requestedAt >= QUALITY_SETTLE_MS) {
+      bitrateState.restore = null;
+      bitrateState.downgradeNote = current >= restore.qn
+        ? `已回到 ${current}，自动回升结束`
+        : `清晰度被改成 ${current}（不是脚本请求的 ${restore.expectQn}），停止自动回升`;
+      return;
+    }
+    if (restore.upgradedAt && now - restore.upgradedAt >= UPGRADE_PROBATION) {
+      restore.upgradedAt = 0;   // 试用期平安度过
+      if (restore.expectQn >= restore.qn) {
+        bitrateState.restore = null;
+        bitrateState.downgradeNote = `已回到降档前的 ${restore.qn}，自动回升结束`;
+        return;
+      }
+    }
+    // 试用期内只看当前源：连续 N 片真实分片低于新档码率就退回。全局告警会被其他源的旧探测值撑住，这里不等它。
+    if (restore.upgradedAt && host === currentCdnSource() && (realRecord(host)?.below || 0) >= HYSTERESIS_SEGMENTS) {
+      maybeDowngrade({ revert: true });
+      return;
+    }
+    if (restore.upgradedAt || host !== currentCdnSource()) return;
+    const target = bitrateState.qualities.filter(qn => qn > current && qn <= restore.qn).pop();
+    const need = target && qualityRequiredKbps(target);
+    if (!target || !need) {
+      restore.ok = 0;
+      return;
+    }
+    restore.target = target;
+    restore.need = need;
+    restore.ok = effectiveKbps >= need * UPGRADE_HEADROOM ? (restore.ok || 0) + 1 : 0;
+    if (restore.ok < UPGRADE_SEGMENTS) return;
+    const quiet = restoreQuiet(restore);
+    if (now - bitrateState.lastDowngradeAt < quiet || now - cdnState.lastStallAt < quiet) return;
+    const video = playbackState.video || document.querySelector('video');
+    if (!video || bufferAhead(video) < PROBE_BUFFER_MIN) return;
+    try {
+      window.player.requestQuality(target);
+    } catch (e) {
+      bitrateState.downgradeNote = '回升调用失败：' + (e?.message || e);
+      bitrateState.restore = null;
+      return;
+    }
+    Object.assign(restore, { from: current, expectQn: target, requestedAt: now, upgradedAt: now, ok: 0 });
+    bitrateState.downgradeNote = `网速恢复（连续 ${UPGRADE_SEGMENTS} 片 ≥ ${Math.round(need * UPGRADE_HEADROOM)} KB/s），已自动从 ${current} 升回 ${target}` +
+      (target < restore.qn ? `，目标 ${restore.qn}` : '');
+    console.warn('[bili-boost] 网速恢复，自动回升一档：', current, '→', target);
+  }
+  // 确认卡顿：回升试用期内立即退回；否则只清零达标计数（安静期由 lastStallAt 保证）。
+  function noteRestoreStall() {
+    const restore = bitrateState.restore;
+    if (!restore || !autoDowngrade) return;
+    restore.ok = 0;
+    if (restore.upgradedAt && Date.now() - restore.upgradedAt < UPGRADE_PROBATION) maybeDowngrade({ revert: true });
   }
   function setAutoDowngrade(on) {
     autoDowngrade = on === true;
+    if (!autoDowngrade) bitrateState.restore = null;
     configSet('autoDowngrade', autoDowngrade);
     renderHud(false);
     return autoDowngrade;
@@ -1978,6 +2077,7 @@
     cdnState.stalls++;
     cdnState.lastStallAt = now;
     recordRealStall(current);
+    noteRestoreStall();
     cdnState.idleWaitCancel?.();
     renderHud(false);
     if (!current) return;
@@ -2454,6 +2554,17 @@
         告警: bitrateState.warn ? { ...bitrateState.warn } : null,
         自动降档: autoDowngrade,
         说明: bitrateState.downgradeNote || '',
+        回升: (() => {
+          const restore = bitrateState.restore;
+          if (!restore) return null;
+          return {
+            降档前: restore.qn, 当前请求: restore.expectQn, 下一档: restore.target ?? null,
+            下一档需要: restore.need ? Math.round(restore.need * UPGRADE_HEADROOM) + ' KB/s' : null,
+            连续达标: `${restore.ok || 0}/${UPGRADE_SEGMENTS}`, 失败次数: restore.failures,
+            等待: Math.round(restoreQuiet(restore) / 1000) + ' 秒',
+            试用中: !!restore.upgradedAt,
+          };
+        })(),
       };
     },
     自动降档(on) { return setAutoDowngrade(on === true) ? '已开：所有源跟不上码率时自动降一档' : '已关：只提示'; },
