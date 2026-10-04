@@ -901,13 +901,16 @@ const QUALITY_PATHS = { 112: '/upgcxcode/09/61/1234567/1234567-1-30112.m4s', 80:
 const QUALITY_BW = { 112: 4_194_304, 80: VIDEO_BANDWIDTH, 64: 1_048_576, 32: 524_288 };
 // 播放器只拉视频分片（脚本没见到音频路径），需求按视频算：80 档 256KB/s（降档门槛 1.2× = 307，回升门槛 1.5× = 384），
 // 64 档 128KB/s（1.2× = 154）。
-function qualityPage() {
-  const net = { bw: 290 };
-  const page = createPage({ speed: () => net.bw }, { hud: true });
+function setQualityPlayinfo(page) {
   const video = Object.entries(QUALITY_PATHS).map(([qn, path]) => ({ id: Number(qn), codecid: 12, codecs: 'hev1.1.6.L120.90',
     bandwidth: QUALITY_BW[qn], width: 1920, height: 1080, frameRate: '30.000', baseUrl: `https://${H('cosov')}${path}?e=sig` }));
   page.sandbox.__playinfo__ = { code: 0, data: { accept_quality: [112, 80, 64, 32], dash: { video,
     audio: [{ id: 30280, codecid: 0, codecs: 'mp4a.40.2', bandwidth: AUDIO_BANDWIDTH, baseUrl: `https://${H('cosov')}${AUDIO_PATH}?e=sig` }] } } };
+}
+function qualityPage() {
+  const net = { bw: 290 };
+  const page = createPage({ speed: () => net.bw }, { hud: true });
+  setQualityPlayinfo(page);
   const calls = [];
   const state = { nowQ: 80 };
   const setQuality = qn => { state.nowQ = qn; page.player.path = QUALITY_PATHS[qn]; };
@@ -1003,6 +1006,86 @@ async function scenarioQualityRestore() {
   stall.page.stopPlayback();
 }
 
+// 场景 10：码率告警里的旧数据时效。开播测速时各源都 600KB/s，之后整体网速掉到 200（< 码率 272）。
+// 缓冲一直不足 15 秒 → 禁测，其他源的 600 旧探测值没人刷新。旧版靠它判“还有源够快”，永远不告警、不降档。
+const DEGRADE_AT = 60_000;
+async function degradeRun(source = SCRIPT, { autoDowngrade = false, onlyCurrent = false, slowKbps = 200, minutes = 8 } = {}) {
+  let t0 = null;
+  const slow = (host, now) => t0 != null && now - t0 >= DEGRADE_AT && (!onlyCurrent || host === H('cosov'));
+  const page = createPage({ speed: (host, offset, kind, now) => (slow(host, now) ? slowKbps : 600) }, { hud: true, source });
+  t0 = page.clock.now;
+  setQualityPlayinfo(page);
+  const calls = [];
+  const state = { nowQ: 80 };
+  page.player.path = QUALITY_PATHS[80];
+  page.sandbox.player = { getQuality: () => ({ nowQ: state.nowQ }), requestQuality: qn => {
+    calls.push({ qn, at: page.clock.now - t0 }); state.nowQ = qn; page.player.path = QUALITY_PATHS[qn]; } };
+  if (autoDowngrade) page.api.自动降档(true);
+  page.startPlayback({ host: H('cosov') });
+  let warnAt = null;
+  let warnHud = '';
+  let earlyWarn = false;
+  const timersBefore = page.clock.timers.size;
+  let minAhead = Infinity;
+  for (let t = 0; t < minutes * 60_000; t += 5_000) {
+    await page.clock.advance(5_000);
+    if (t >= DEGRADE_AT) minAhead = Math.min(minAhead, page.bufferAhead());
+    const warn = page.api.码率.告警;
+    if (!warn) continue;
+    if (warnAt == null) { warnAt = page.clock.now - t0; warnHud = page.hudText(); }
+    // 最近一轮测速还新鲜（<3 分钟）时，旧逻辑照常：其他源的新数据够快就不该告警。
+    const roundTs = page.api.测速结果?.ts;
+    if (roundTs && page.clock.now - roundTs < 180_000 && warn.stale === 0 && warn.best >= 600 * 0.9) earlyWarn = true;
+  }
+  const out = { page, calls, warnAt, probes: page.net.probes.length, minAhead, warnHud, earlyWarn, warn: page.api.码率.告警, source: page.api.当前源,
+    timersGrew: page.clock.timers.size > timersBefore };
+  page.stopPlayback();
+  return out;
+}
+async function scenarioStaleEvidence() {
+  const run = await degradeRun();
+  check('10 整体降速且禁测时，其他源的旧探测值 3 分钟后不再撑住码率告警',
+    run.warnAt != null && run.warnAt > DEGRADE_AT && run.warnAt <= DEGRADE_AT + 180_000 + 60_000 && !run.earlyWarn &&
+    run.warn?.stale >= 1 && /未计入/.test(run.warnHud) && run.calls.length === 0,
+    `降速后 ${run.warnAt == null ? '从不' : Math.round((run.warnAt - DEGRADE_AT) / 1000) + 's'} 告警；告警=${JSON.stringify(run.warn)}；` +
+    `HUD=${JSON.stringify(run.warnHud.split('\n').find(line => /码率/.test(line)) || '')}`);
+  const legacy = legacySource();
+  if (legacy && legacy !== SCRIPT) {
+    const old = await degradeRun(legacy);
+    check('10 对照：旧版（origin/main）同场景 8 分钟内从不告警', old.warnAt == null,
+      `旧版告警时间=${old.warnAt}；新版=${run.warnAt}`);
+  }
+  const auto = await degradeRun(SCRIPT, { autoDowngrade: true });
+  check('10 打开自动降档时，旧数据过期后真正降一档（80→64），只降一次',
+    auto.calls.length === 1 && auto.calls[0].qn === 64 && auto.calls[0].at > DEGRADE_AT && !auto.timersGrew,
+    `requestQuality=${JSON.stringify(auto.calls)}；${auto.page.api.码率.说明}`);
+  // 当前源 290：够 1.0× 码率（缓冲不掉），不够 1.2×；其他源其实仍有 600。旧数据过期后不该直接告警/降档，
+  // 而是在缓冲充足时补测一轮拿新数据——新数据证明还有快源，就不告警。
+  const only = await degradeRun(SCRIPT, { autoDowngrade: true, onlyCurrent: true, slowKbps: 290 });
+  const firstProbes = (await degradeRun(SCRIPT, { onlyCurrent: true, slowKbps: 290, minutes: 1 })).probes;
+  check('10 当前源略低于 1.2×、缓冲充足、其他源旧数据过期：先补测拿新数据，不误告警、不降档',
+    only.warnAt == null && only.calls.length === 0 && only.probes > firstProbes && only.minAhead >= 15 && !only.timersGrew,
+    `告警=${only.warnAt}；降档=${JSON.stringify(only.calls)}；探测 ${firstProbes} → ${only.probes} 次；降速后最低缓冲 ${only.minAhead.toFixed(1)}s；` +
+    `测速原因=${only.page.api.测速结果?.why}；当前源=${shortHost(only.source)}`);
+
+  // 其他源自己的真实分片还新鲜（<3 分钟）时照常计入：刚从 08c（600）手动切到 cosov（290），不告警也不需要补测。
+  const page = createPage({ speed: host => (host === H('cosov') ? 290 : 600) }, { hud: true });
+  page.setPlayinfo();
+  page.sandbox.player = { getQuality: () => ({ nowQ: 80 }), requestQuality: () => { } };
+  page.startPlayback({ host: H('cosov') });
+  await page.clock.advance(5_000);
+  page.api.手动选源(H('08c'));
+  await page.clock.advance(225_000);           // 08c 播 3 分多钟，开播那轮测速已过期
+  page.api.手动选源(H('cosov'));
+  const probesAt = page.net.probes.length;
+  let warned = false;
+  for (let t = 0; t < 120_000; t += 5_000) { await page.clock.advance(5_000); warned ||= !!page.api.码率.告警; }
+  const real = page.api.真实速度;
+  check('10 其他源的真实分片还新鲜时照常计入（刚切走的快源撑住告警），不额外补测',
+    !warned && page.net.probes.length === probesAt && /08c/.test(Object.keys(real).join()) && page.api.当前源 === H('cosov'),
+    `告警=${warned}；补测 ${page.net.probes.length - probesAt} 次；真实速度=${JSON.stringify(real)}`);
+  page.stopPlayback();
+}
 async function contrast() {
   let legacy;
   try {
@@ -1036,6 +1119,7 @@ await scenarioBanRecovery();
 await scenarioDiagnostics();
 await scenarioRealPrior();
 await scenarioQualityRestore();
+await scenarioStaleEvidence();
 if (CONTRAST) await contrast();
 const failed = results.filter(item => !item.pass);
 console.log(`\n=== qa-stall：PASS=${results.length - failed.length} FAIL=${failed.length}，耗时 ${((Date.now() - started) / 1000).toFixed(1)}s ===`);
