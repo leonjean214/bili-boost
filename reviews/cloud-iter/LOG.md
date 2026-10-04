@@ -280,3 +280,40 @@
 - Win/Safari 实测：原始源慢的视频看 `切源记录` 里是否出现「开播快筛」，以及开播前 20 秒的卡顿是否减少。
 - 场景 10 的旧版对照兜底（旧版没有 `码率` 接口时跳过）仍未做。
 - 叠层已 3 层（#11→#12→本 PR）。下一轮再叠就到 4 层，按任务单只做回归加固、文档或测试，建议先人工审查合并。
+
+## 2026-10-04 18:00 UTC · cloud/iter-20261004-1800（叠在 #13 上，base=cloud/iter-20261004-1518）
+
+**基线**：未合并的有 #11（base=main）→ #12 → #13，都没有评论或审查意见。本 PR 叠上去是第 4 层，按任务单和上一轮建议，**不写新功能，只做回归加固**。改前 `node tools/qa-stall.mjs`：PASS=69 FAIL=0。
+
+**选题**：#12、#13 两轮都留下的「旧版对照兜底」。复现时发现问题比 LOG 里记的更大：
+- 旧 main 缺 `码率` 接口时（`QA_LEGACY_REF=f4dac7a`），场景 10 抛 `TypeError: Cannot read properties of undefined (reading '告警')`，**整套回归中断**，后面的场景都不跑。
+- 更要紧的是叠层合并后的误报：对照永远拿 `origin/main` 当「改动前」。#11 一合进 main，在 #12/#13 分支上跑，场景 10 的对照就会 FAIL（旧版也会告警了）；#12 也合进去后，场景 11 的对照同样 FAIL。实测：`QA_LEGACY_REF=origin/cloud/iter-20261004-0618` → FAIL=1，`…-0918` → FAIL=2。也就是说，用户按顺序合并这串 PR 时，剩下的 PR 会被回归误判为红。
+
+**改动**（只改 `tools/qa-stall.mjs`，`bili-boost.user.js` 不动）：
+- `contrastRun(name, marker, run, assess)`：读不到旧版、旧版与当前相同、旧版已含 marker（本改动引入的标识符：场景 10 `staleBest`、11 `switchOnSlowSegments`、12 `applyStartupQuick`）、旧版运行抛错，这四种情况都记 `SKIP` 并写明原因，不算 FAIL，不中断。只包旧版那次运行，新版的断言不受影响。
+- marker 必须仍在当前脚本里，否则直接 FAIL（防止改名后 marker 失效，合并后又误报）。
+- 汇总行增加 `SKIP=n`（没有跳过时不显示，输出与原来一致）。
+- `QA_LEGACY_REF` 环境变量：指定对照用的 ref（默认仍是 origin/main → main）。叠层 PR 可以拿自己的 base 分支对照。
+- 场景 8 已经有 `realPrior` 判断，而且测的是「旧版能读新档案」，抛错本身就该算失败，所以不包。
+
+**测试**：
+- `node --check bili-boost.user.js` / `node --check tools/qa-stall.mjs` / `git diff --check`：OK。
+- 默认 `node tools/qa-stall.mjs`：**PASS=69 FAIL=0**（与改前一致，5 项对照照常跑）。
+- 不同旧版 ref：
+  - `QA_LEGACY_REF=f4dac7a`（缺接口）：改前抛 TypeError 中断；改后 PASS=65 FAIL=0 SKIP=4（原因「旧版跑不起来」）。
+  - `…-0618`（#11 已合并的情形）：改前 FAIL=1；改后 PASS=68 SKIP=1（场景 10「旧版已含本改动」），11/12 的对照照常跑并通过。
+  - `…-0918`（#11+#12 已合并）：改前 FAIL=2；改后 PASS=67 SKIP=2，12 的对照照常通过。
+  - `…-1518`（与当前相同）：PASS=65 SKIP=4（「旧版与当前脚本相同」）。
+  - `no-such-ref`：PASS=65 SKIP=4（「读不到旧版」）。
+- 变异验证：把场景 11 的 marker 改成当前脚本不存在的名字 → FAIL=1（「对照标识仍在当前脚本」），恢复后通过。
+- `node tools/qa-stall.mjs --contrast`：PASS=69。
+- `node tools/qa-boost.mjs` 没跑：按 AGENTS.md，浏览器 QA 只在 Win 台式机上跑，云端也访问不了 bilibili.com；本轮不改脚本本体。
+
+**风险**：
+- 旧版运行抛错一律记 SKIP。如果是测试工具本身的 bug 只在旧版路径上出现，也会被当成 SKIP；但原因会打印出来，汇总行能看到 SKIP 数。
+- marker 只按标识符判断「旧版是否已含改动」。如果以后有人把同名标识符用于别的用途，对照会被误跳过（不会误报 FAIL）。
+
+**遗留 / 下一轮建议**：
+- 叠层已 4 层（#11→#12→#13→本 PR）。下一轮按任务单不再写新功能，建议先人工审查，按顺序合并 #11→#12→#13→本 PR。本 PR 合并后，合并顺序不会再导致对照误报。
+- Win/Safari 实测：#12「跟不上码率」、#13「开播快筛」的切源记录。
+- 场景内的对照名称写死「旧版（origin/main）」，用 `QA_LEGACY_REF` 时名字不准，属于纯文案，未改。
