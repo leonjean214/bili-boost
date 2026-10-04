@@ -849,13 +849,14 @@
     return `滞回：${shortName(from)} 未连续 ${HYSTERESIS_SEGMENTS} 片低于码率，${shortName(to)} 也未在真实分片上持续更快`;
   }
   // 只改后续请求的目标 host；正在传输的分片保持原连接，绝不 abort 播放器请求。
-  function commitAutoSwitch(key, from, to, why) {
+  // limit=false：不计入 60 秒限频（仅开播快筛的暂定切换用，每个媒体目录最多一次）。
+  function commitAutoSwitch(key, from, to, why, { limit = true } = {}) {
     cdnState.picked.set(key, to);
     saveCdnCache(key, to);
     cdnState.held = null;
     if (!from || from === to) return;
-    cdnState.lastSwitchAt = Date.now();
-    cdnState.switchLog.push({ at: cdnState.lastSwitchAt, from, to, why });
+    if (limit) cdnState.lastSwitchAt = Date.now();
+    cdnState.switchLog.push({ at: Date.now(), from, to, why });
     if (cdnState.switchLog.length > 8) cdnState.switchLog.shift();
   }
   // 只认 3 分钟内的证据：该源自己的真实分片，或本轮测速（整轮未过期）。健康档案/过期探测不算。
@@ -893,6 +894,32 @@
     }
     // 毫无数据：只有确认卡顿才按候选顺序盲切（历史结论：08c 常最快，排第一）。
     return stall ? { host: pool[0], via: '候选顺序', kbps: null } : null;
+  }
+
+  // 开播首轮快筛一跑完就先按快筛结论改写后续分片，不等精测。精测要等缓冲 ≥15 秒（最多 20 秒），
+  // 原始源慢时缓冲涨不上去，以前只能在慢源上眼看缓冲耗尽、卡一次才切，而快筛早已知道哪个源快。
+  // 门槛与精测一致（同健康档、快 25%），另要求候选 ≥1.2×码率；精测照跑，结论按常规规则修正。
+  // 暂定切换不计入 60 秒限频，免得挡住精测修正或“跟不上码率”的主动切源（头部缓存骗过快筛时靠它们纠正）。
+  function applyStartupQuick(key, origHost, quick) {
+    if (cdnState.manual.get(key) || cdnState.curKey !== key) return;
+    const bad = cdnState.rejected.get(key);
+    const eligible = quick.filter(result => probeSucceeded(result) &&
+      !isBanned(result.host) && !(bad && bad.has(result.host))).sort(compareHosts);
+    const best = eligible[0];
+    if (!best) return;
+    const active = cdnState.activeHost && canRewriteHost(origHost, cdnState.activeHost) ? cdnState.activeHost : null;
+    const inUse = active || cdnState.picked.get(key) || origHost;
+    if (best.host === inUse) return;
+    const incumbent = eligible.find(result => result.host === inUse);
+    if (incumbent && healthTier(incumbent.host) === healthTier(best.host) &&
+        deliveryMs(best) >= deliveryMs(incumbent) / MIN_GAIN) return;
+    const kbps = best.fusedKbps ?? best.effectiveKbps ?? best.kbps;
+    if (!(kbps >= needKbps() * BITRATE_HEADROOM)) return;
+    if (switchBlockedReason(inUse, best.host, { fromFailed: !incumbent })) return;
+    commitAutoSwitch(key, inUse, best.host, '开播快筛', { limit: false });
+    cdnState.perf.length = 0;
+    console.log('[bili-cdn] 开播快筛先切到', best.host, `（${kbps}KB/s），精测稍后确认`);
+    renderHud(false);
   }
 
   // ---- 测速门控：全局并发 1、缓冲不足禁测、超时必清理 ----
@@ -1151,6 +1178,7 @@
       quick.sort(compareHosts);
 
       const finalists = quick.filter(probeSucceeded).slice(0, FINALISTS);
+      if (why === '开播' && !manual && !incomplete && alive()) applyStartupQuick(key, origHost, quick);
       const full = [];
       if (finalists.length && !incomplete) {
         const stallsBeforeWait = cdnState.stalls;

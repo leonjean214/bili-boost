@@ -1136,6 +1136,78 @@ async function scenarioSlowSegments() {
   const late = await degradeRun(SCRIPT, { onlyCurrent: true, slowKbps: 150, minutes: 8, degradeAt: 240_000 });
   check('11 其他源只有过期（>3 分钟）测速时不凭旧数字主动切源', slowSwitches(late).length === 0, describeRun(late));
 }
+// 场景 12：开播快筛结论即时生效。原始源 cosov 只有 120KB/s（< 码率 272），08c 900。
+// 旧版快筛在首帧前就跑完了，但要等精测（缓冲 ≥15 秒，最多等 20 秒）才切，缓冲涨不上去，只能卡一次后才切。
+async function startupRun(source = SCRIPT, { caps = {}, liarHead = 0, manual = null, paused = false, seconds = 60 } = {}) {
+  const model = {
+    speed(host, offset) {
+      if (liarHead && host === H('hw')) return offset < liarHead ? 40_000 : 120;
+      return caps[host] ?? 300;
+    },
+    ttfb: () => 120,
+  };
+  const page = createPage(model, { hud: false, source });
+  page.setPlayinfo(H('cosov'));
+  page.startPlayback({ host: H('cosov') });
+  if (paused) page.video.paused = true;   // 未自动播放：播放器照常预载，快筛不受缓冲门控影响、总能跑完
+  const t0 = page.clock.now;
+  if (manual) {
+    // 首个分片发出后（脚本已认出媒体目录、开播快筛正在跑）用户手选。
+    await page.clock.advance(300);
+    page.api.手动选源(manual);
+  }
+  let firstFrame = null;
+  page.video.addEventListener('timeupdate', () => { firstFrame ??= page.clock.now - t0; });
+  let minAhead = Infinity;
+  const timersAfterStart = page.clock.timers.size;
+  for (let i = 0; i < seconds; i++) {
+    await page.clock.advance(1000);
+    if (page.clock.now - t0 > 6000) minAhead = Math.min(minAhead, page.bufferAhead());
+  }
+  const log = page.api.切源记录;
+  return { page, t0, firstFrame, minAhead, stalls: page.api.卡顿次数, log, quick: log.filter(item => item.why === '开播快筛'),
+    source: page.api.当前源, timersGrew: page.clock.timers.size > timersAfterStart + 1,
+    text: `切源=${log.map(item => `${short(item.from)}→${short(item.to)}@${((item.at - t0) / 1000).toFixed(1)}s(${item.why})`).join('，') || '无'}；` +
+      `首帧 ${firstFrame}ms；卡顿 ${page.api.卡顿次数} 次；6 秒后最低缓冲 ${minAhead.toFixed(1)}s；当前源=${short(page.api.当前源)}；探测 ${page.net.probes.length} 次` };
+}
+async function scenarioStartupQuick() {
+  const slowOrig = { [H('cosov')]: 120, [H('08c')]: 900 };
+  const run = await startupRun(SCRIPT, { caps: slowOrig });
+  const first = run.quick[0];
+  check('12 原始源慢：快筛一跑完就切到快源（不等精测），开播 60 秒 0 卡顿',
+    run.quick.length === 1 && first.from === H('cosov') && first.to === H('08c') && first.at - run.t0 <= 6_000 &&
+    run.stalls === 0 && run.source === H('08c') && !run.timersGrew, run.text);
+  const legacy = legacySource();
+  if (legacy && legacy !== SCRIPT) {
+    const old = await startupRun(legacy, { caps: slowOrig });
+    check('12 对照：旧版（origin/main）同场景要卡一次才切走', old.stalls >= 1 && run.stalls < old.stalls,
+      `旧版：${old.text}`);
+  }
+  // 精测照跑，并且能修正暂定结论：快筛后 08c 不计入限频，精测/卡顿/跟不上码率仍可随时切。
+  const result = run.page.api.测速结果;
+  check('12 精测照常跑完并确认快筛结论（不再多切一次）',
+    result && !result.incomplete && result.win === H('08c') && run.log.length === 1 && !result.held,
+    `测速结果 win=${short(result?.win)} incomplete=${result?.incomplete} 原因=${result?.why} held=${result?.held}`);
+  // 头部缓存骗过快筛（hw 前 2MB 40000KB/s、之后 120）：暂定切到 hw 后，卡顿路径不被 60 秒限频挡住，立刻纠正。
+  const lie = await startupRun(SCRIPT, { caps: { [H('cosov')]: 120, [H('08c')]: 600 }, liarHead: 2 * MB, seconds: 120 });
+  const fixAt = lie.log.find(item => item.from === H('hw'))?.at;
+  check('12 快筛被头部缓存骗到 hw：暂定切换不占 60 秒限频，30 秒内被纠正，卡顿 ≤1 次',
+    lie.quick[0]?.to === H('hw') && fixAt && fixAt - lie.quick[0].at <= 30_000 && lie.stalls <= 1 && lie.source !== H('hw'), lie.text);
+  if (legacy && legacy !== SCRIPT) {
+    const old = await startupRun(legacy, { caps: { [H('cosov')]: 120, [H('08c')]: 600 }, liarHead: 2 * MB, seconds: 120 });
+    check('12 对照：同一骗局旧版卡顿更多', old.stalls > lie.stalls, `旧版：${old.text}`);
+  }
+  // 原始源够用（500 vs 08c 560，快不到 25%；快筛跑完时 cosov 真实分片不足 3 片，滞回兜不住，只能靠这道门槛）：不做暂定切换。暂停预载，确保快筛跑完、确实走到这道门槛。
+  const fine = await startupRun(SCRIPT, { caps: { [H('cosov')]: 500, [H('08c')]: 560 }, paused: true });
+  const fineProbed = fine.page.api.测速结果?.list.length;
+  check('12 原始源已够用（候选快不到 25%）时不暂定切换', fine.quick.length === 0 && fineProbed >= 6, `测到 ${fineProbed} 个源；${fine.text}`);
+  // 所有候选都 < 1.2×码率（300 < 326）：切过去也没余量，不暂定切换。
+  const weak = await startupRun(SCRIPT, { caps: { [H('cosov')]: 120, [H('08c')]: 300 } });
+  check('12 候选都不到 1.2×码率时不暂定切换', weak.quick.length === 0, weak.text);
+  // 开播前手选了 cosov：不动。
+  const man = await startupRun(SCRIPT, { caps: slowOrig, manual: H('cosov') });
+  check('12 手选源时不暂定切换', man.quick.length === 0, man.text);
+}
 async function contrast() {
   let legacy;
   try {
@@ -1171,6 +1243,7 @@ await scenarioRealPrior();
 await scenarioQualityRestore();
 await scenarioStaleEvidence();
 await scenarioSlowSegments();
+await scenarioStartupQuick();
 if (CONTRAST) await contrast();
 const failed = results.filter(item => !item.pass);
 console.log(`\n=== qa-stall：PASS=${results.length - failed.length} FAIL=${failed.length}，耗时 ${((Date.now() - started) / 1000).toFixed(1)}s ===`);
