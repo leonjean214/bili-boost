@@ -56,6 +56,13 @@
   const HEALTH_MAX_HOSTS = 32;
   const HEALTH_MAX_ATTEMPTS = 24;    // 到上限后衰减旧样本，避免陈年成功率支配当前网络
   const HEALTH_SPEED_ALPHA = 0.4;    // 速度/TTFB 走指数滑动平均，新样本权重
+  // 实播指标闭环：真实分片有效速度（滑动平均）和卡顿次数写进同一份健康档案（同受 7 天 / 32 条双上限），
+  // 下次开播、本会话还没有该源的真实分片时，作为先验与探测值融合（探测常被头部缓存抬高）。
+  const HEALTH_PRIOR_MIN_SEGMENTS = 3;  // 至少 3 片真实分片才当先验
+  const HEALTH_PRIOR_MAX_AGE = 24 * 3600e3; // 先验只看 24 小时内的实播（换网/换 VPN 后不长期粘住）
+  const HEALTH_PRIOR_WEIGHT = 0.35;  // 先验权重低于本会话真实分片（0.6/0.8），高于“没有”
+  const HEALTH_STALL_WEIGHT = 4;     // 每次卡顿折算为 4 片的惩罚：每 4 片 1 次卡顿 → 先验减半
+  const HEALTH_REAL_SAVE_INTERVAL = 30e3; // 实播样本最多 30 秒落盘一次；不加定时器，随分片顺带检查
   // v1.7.0：前向缓冲低于 15 秒时禁止一切探测（快筛、精测、重测），只用已有数据决策。
   // 开播前（还没开始前进）和暂停时不受限：那时没有正在播放的分片可抢带宽。
   const PROBE_BUFFER_MIN = 15;
@@ -84,12 +91,14 @@
       const oldAttempts = Math.floor(value.attempts);
       const oldSuccesses = Math.floor(value.successes);
       const at = Number(value.at);
-      if (!Number.isFinite(oldAttempts) || oldAttempts < 1 ||
+      const real = normalizeRealHealth(value, now);
+      // 只在实播里出现、从未被探测的源（如未改写的原始源）允许 attempts=0，但必须带有效实播数据。
+      if (!Number.isFinite(oldAttempts) || oldAttempts < (real ? 0 : 1) ||
           !Number.isFinite(oldSuccesses) || oldSuccesses < 0 ||
           !Number.isFinite(at) || now - at >= HEALTH_MAX_AGE) continue;
       const attempts = Math.min(oldAttempts, HEALTH_MAX_ATTEMPTS);
-      const successes = Math.min(attempts,
-        Math.round(Math.min(oldSuccesses, oldAttempts) / oldAttempts * attempts));
+      const successes = attempts ? Math.min(attempts,
+        Math.round(Math.min(oldSuccesses, oldAttempts) / oldAttempts * attempts)) : 0;
       const kbps = Math.round(value.kbps);
       const ttfb = Math.round(value.ttfb);
       entries.push([host, {
@@ -98,6 +107,7 @@
         kbps: Number.isFinite(kbps) && kbps > 0 ? kbps : 0,
         ttfb: Number.isFinite(ttfb) && ttfb >= 0 ? ttfb : 0,
         at: Math.min(at, now),
+        ...real,
       }]);
     }
     entries.sort((a, b) => b[1].at - a[1].at || a[0].localeCompare(b[0]));
@@ -106,6 +116,22 @@
     return out;
   }
 
+  // 实播字段是可选的：旧档案没有它们；字段不合法就整组丢弃，绝不因此丢掉探测统计。
+  function normalizeRealHealth(value, now) {
+    const realN = Math.floor(value.realN);
+    const real = Math.round(value.real);
+    const realAt = Number(value.realAt);
+    if (!Number.isFinite(realN) || realN < 1 || !Number.isFinite(real) || real <= 0 ||
+        !Number.isFinite(realAt) || now - realAt >= HEALTH_MAX_AGE) return null;
+    const stalls = Math.floor(value.stalls);
+    const n = Math.min(realN, HEALTH_MAX_ATTEMPTS);
+    return {
+      real,
+      realN: n,
+      stalls: Number.isFinite(stalls) && stalls > 0 ? Math.min(stalls, n) : 0,
+      realAt: Math.min(realAt, now),
+    };
+  }
   function loadHealth() {
     try {
       const raw = JSON.parse(localStorage.getItem(HEALTH_KEY) || '{}');
@@ -117,8 +143,10 @@
   const loadedHealth = loadHealth();
   let health = loadedHealth.records;
   let healthDirty = loadedHealth.migrated;
+  let healthSavedAt = 0;
   function saveHealth(force = false) {
     if (!force && !healthDirty) return;
+    healthSavedAt = Date.now();
     health = normalizeHealth(health);
     try {
       localStorage.setItem(HEALTH_KEY, JSON.stringify({
@@ -161,6 +189,53 @@
     // 新 host 记录完成后立即按最近更新时间维持 32 条上限，避免测速进行中短暂暴露第 33 条。
     health = normalizeHealth(health);
     healthDirty = true;
+  }
+  // 实播样本按片计；到上限后片数与卡顿数一起减半，让旧网络的表现逐步让位。
+  function shrinkRealHealth(r) {
+    if ((r.realN || 0) < HEALTH_MAX_ATTEMPTS) return;
+    const kept = Math.floor(HEALTH_MAX_ATTEMPTS / 2);
+    r.stalls = Math.round((r.stalls || 0) / r.realN * kept);
+    r.realN = kept;
+  }
+  function recordRealHealth(host, effectiveKbps) {
+    if (!host || !Number.isFinite(effectiveKbps) || effectiveKbps <= 0) return;
+    const now = Date.now();
+    if (!health[host]) {
+      // 新 host 立即按 32 条上限裁剪（同 recordProbe），带上首个实播样本才不会被当作空记录丢掉。
+      health[host] = { attempts: 0, successes: 0, kbps: 0, at: now,
+        real: Math.round(effectiveKbps), realN: 1, stalls: 0, realAt: now };
+      health = normalizeHealth(health);
+      healthDirty = true;
+      if (now - healthSavedAt >= HEALTH_REAL_SAVE_INTERVAL) saveHealth();
+      return;
+    }
+    const r = health[host];
+    shrinkRealHealth(r);
+    r.real = r.real && r.realN
+      ? Math.round(r.real * (1 - HEALTH_SPEED_ALPHA) + effectiveKbps * HEALTH_SPEED_ALPHA)
+      : Math.round(effectiveKbps);
+    r.realN = (r.realN || 0) + 1;
+    r.stalls = r.stalls || 0;
+    r.realAt = r.at = now;
+    healthDirty = true;
+    if (now - healthSavedAt >= HEALTH_REAL_SAVE_INTERVAL) saveHealth();
+  }
+  // 卡顿记到当时在用的源上；该源还没有实播片数时不记（没有分母，也说明卡顿不是它的分片造成的）。
+  function recordRealStall(host) {
+    const r = host && health[host];
+    if (!r || !r.realN) return;
+    shrinkRealHealth(r);
+    r.stalls = Math.min(r.realN, (r.stalls || 0) + 1);
+    r.realAt = r.at = Date.now();
+    healthDirty = true;
+    saveHealth();
+  }
+  // 上次实播的先验速度：滑动均速按卡顿率折扣。样本不足或超过 24 小时返回 null。
+  function realPrior(host) {
+    const r = health[host];
+    if (!r || !r.real || (r.realN || 0) < HEALTH_PRIOR_MIN_SEGMENTS ||
+        Date.now() - (r.realAt || 0) >= HEALTH_PRIOR_MAX_AGE) return null;
+    return Math.max(1, Math.round(r.real * r.realN / (r.realN + HEALTH_STALL_WEIGHT * (r.stalls || 0))));
   }
   function ratioOf(host) {
     const r = health[host];
@@ -513,6 +588,8 @@
   // 只清媒体态；全局赢家、黑名单和带 TTL 的缓存仍保持原脚本语义。
   function resetMediaState(reason, nextId = mediaIdentity()) {
     mediaGeneration++;
+    // 换视频/分 P 时把上一个视频攒下的实播样本落盘（不足 30 秒节流窗口的部分也不丢）。
+    saveHealth();
     cdnState.idleWaitCancel?.();
     codecState.statusPending?.cancel();
     lastPlayRequestId = null;
@@ -702,7 +779,12 @@
   function fusedKbps(host, probeResult) {
     const real = realSamples(host);
     const probe = probeEffective(probeResult);
-    if (!real.length) return probe;
+    if (!real.length) {
+      // 本会话还没有该源的真实分片：用上次实播的先验（24 小时内、≥3 片、按卡顿率折扣）。
+      const prior = realPrior(host);
+      if (prior == null || probe == null) return prior ?? probe;
+      return Math.round(1 / (HEALTH_PRIOR_WEIGHT / prior + (1 - HEALTH_PRIOR_WEIGHT) / probe));
+    }
     const realMedian = Math.max(1, median(real));
     if (probe == null) return realMedian;
     const weight = real.length >= HYSTERESIS_SEGMENTS ? REAL_WEIGHT_MANY : REAL_WEIGHT_FEW;
@@ -713,6 +795,7 @@
     if (fused == null) return result;
     result.fusedKbps = fused;
     result.realSamples = realSamples(result.host).length;
+    if (!result.realSamples) result.priorKbps = realPrior(result.host);
     result.deliveryMs = FULL_BYTES / 1024 / Math.max(1, fused) * 1000;
     return result;
   }
@@ -721,9 +804,13 @@
     if (!host) return null;
     const probe = cdnState.lastResults?.list.find(item => item.host === host);
     const fused = fusedKbps(host, probe);
-    if (fused != null) return { kbps: fused, via: realSamples(host).length ? '真实分片' : '测速' };
-    const history = health[host];
     const ratio = ratioOf(host);
+    if (fused != null) {
+      const via = realSamples(host).length ? '真实分片' : realPrior(host) != null ? '历史实播' : '测速';
+      // 只有先验、本会话没测过：与旧的“历史均速”同一门槛，成功率 <50% 的源不凭旧实播翻身。
+      if (via !== '历史实播' || probe || ratio === null || ratio >= 0.5) return { kbps: fused, via };
+    }
+    const history = health[host];
     if (history?.kbps && (ratio === null || ratio >= 0.5)) return { kbps: Math.round(history.kbps / 2), via: '历史' };
     return null;
   }
@@ -1415,6 +1502,7 @@
       ttfb: metrics.ttfb, bytes: got, via });
     if (cdnState.perf.length > PERF_WINDOW) cdnState.perf.shift();
     noteRealSample(request.host, metrics.effectiveKbps);
+    recordRealHealth(request.host, metrics.effectiveKbps);
     checkBitrateHeadroom();
     renderHud(false);
   }
@@ -1889,6 +1977,7 @@
     playbackState.lastConfirmedAt = now;
     cdnState.stalls++;
     cdnState.lastStallAt = now;
+    recordRealStall(current);
     cdnState.idleWaitCancel?.();
     renderHud(false);
     if (!current) return;
@@ -2254,7 +2343,7 @@
         未完成精测: !!results.incomplete,
         列表: results.list.map(result => ({
           host: result.host, ok: probeSucceeded(result), kbps: result.kbps, effectiveKbps: result.effectiveKbps,
-          fusedKbps: result.fusedKbps, ttfb: result.ttfb, realSamples: result.realSamples,
+          fusedKbps: result.fusedKbps, priorKbps: result.priorKbps, ttfb: result.ttfb, realSamples: result.realSamples,
           stage: result.stage, note: result.note,
           points: result.points?.map(point => ({ point: point.point, kbps: point.kbps, ttfb: point.ttfb, note: point.note })),
         })),
@@ -2412,7 +2501,9 @@
         out[shortName(host)] = `${r.successes}/${r.attempts} 成功` +
           (r.attempts >= HEALTH_MIN_ATTEMPTS ? ` (${Math.round(r.successes / r.attempts * 100)}%)` : ' (样本不足)') +
           (r.kbps ? ` · 滑动均速 ${r.kbps}KB/s` : '') +
-          (r.ttfb ? ` · TTFB ${r.ttfb}ms` : '');
+          (r.ttfb ? ` · TTFB ${r.ttfb}ms` : '') +
+          (r.realN ? ` · 实播 ${r.real}KB/s×${r.realN} 片 卡顿 ${r.stalls || 0}` +
+            (realPrior(host) != null ? `（先验 ${realPrior(host)}KB/s）` : '') : '');
       }
       return out;
     },
