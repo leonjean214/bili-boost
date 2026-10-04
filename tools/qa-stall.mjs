@@ -5,6 +5,7 @@
 //   node tools/qa-stall.mjs            # 跑全部
 //   node tools/qa-stall.mjs --verbose  # 同时打印脚本日志
 //   node tools/qa-stall.mjs --contrast # 额外用 main 分支旧版跑同场景做对照（需要 git）
+//   QA_LEGACY_REF=<ref> node tools/qa-stall.mjs  # 场景内「旧版对照」改用指定 ref（默认 origin/main）；旧版已含该改动或跑不起来时记 SKIP
 import { execFileSync } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
 import vm from 'node:vm';
@@ -28,6 +29,11 @@ const results = [];
 const check = (name, pass, detail = '') => {
   results.push({ name, pass: !!pass, detail });
   console.log(`${pass ? 'PASS' : 'FAIL'}  ${name}${detail ? '  — ' + detail : ''}`);
+};
+const skipped = [];
+const skip = (name, why) => {
+  skipped.push({ name, why });
+  console.log(`SKIP  ${name}  — ${why}`);
 };
 const flush = async () => { for (let i = 0; i < 4; i++) await new Promise(resolve => setImmediate(resolve)); };
 
@@ -794,14 +800,29 @@ async function openRound(seed, source = SCRIPT) {
   await page.clock.advance(30_000);
   return { page, result: page.api.测速结果 };
 }
+// 旧版对照默认取 origin/main（没有就取 main）；QA_LEGACY_REF 可指定任意 ref（叠层 PR 想对照它的 base 分支时用）。
+const LEGACY_REFS = process.env.QA_LEGACY_REF ? [process.env.QA_LEGACY_REF] : ['origin/main', 'main'];
 function legacySource() {
-  for (const ref of ['origin/main', 'main']) {
+  for (const ref of LEGACY_REFS) {
     try {
       return execFileSync('git', ['show', `${ref}:bili-boost.user.js`], {
         cwd: new URL('..', import.meta.url), encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
     } catch { }
   }
   return null;
+}
+// 旧版对照的兜底：读不到旧版、旧版已含本改动（叠层 PR 合进 main 后）、旧版缺接口跑不动时记 SKIP，不算 FAIL 也不中断整套回归。
+// marker 是本改动引入的标识符：旧版里已有它，说明旧版不再是「改动前」，对照没有意义。
+async function contrastRun(name, marker, run, assess) {
+  // marker 必须仍在当前脚本里，否则改名后旧版永远「不含本改动」，合并后对照又会误报。
+  if (!marker.test(SCRIPT)) return check(`${name}（对照标识仍在当前脚本）`, false, `当前脚本找不到 ${marker.source}，请同步 marker`);
+  const legacy = legacySource();
+  if (!legacy) return skip(name, `读不到旧版（${LEGACY_REFS.join(' / ')}）`);
+  if (legacy === SCRIPT) return skip(name, '旧版与当前脚本相同');
+  if (marker.test(legacy)) return skip(name, `旧版已含本改动（${marker.source}），无可对照`);
+  let old;
+  try { old = await run(legacy); } catch (error) { return skip(name, `旧版跑不起来：${error?.message || error}`); }
+  assess(old);
 }
 async function scenarioRealPrior() {
   // 会话 1：手选 cosov，在暂停态拉 6 片真实分片（间隔 8 秒，跨过 30 秒落盘节流）。
@@ -1051,12 +1072,9 @@ async function scenarioStaleEvidence() {
     run.warn?.stale >= 1 && /未计入/.test(run.warnHud) && run.calls.length === 0,
     `降速后 ${run.warnAt == null ? '从不' : Math.round((run.warnAt - DEGRADE_AT) / 1000) + 's'} 告警；告警=${JSON.stringify(run.warn)}；` +
     `HUD=${JSON.stringify(run.warnHud.split('\n').find(line => /码率/.test(line)) || '')}`);
-  const legacy = legacySource();
-  if (legacy && legacy !== SCRIPT) {
-    const old = await degradeRun(legacy);
-    check('10 对照：旧版（origin/main）同场景 8 分钟内从不告警', old.warnAt == null,
-      `旧版告警时间=${old.warnAt}；新版=${run.warnAt}`);
-  }
+  await contrastRun('10 对照：旧版（origin/main）同场景 8 分钟内从不告警', /staleBest/, legacy => degradeRun(legacy),
+    old => check('10 对照：旧版（origin/main）同场景 8 分钟内从不告警', old.warnAt == null,
+      `旧版告警时间=${old.warnAt}；新版=${run.warnAt}`));
   const auto = await degradeRun(SCRIPT, { autoDowngrade: true });
   check('10 打开自动降档时，旧数据过期后真正降一档（80→64），只降一次',
     auto.calls.length === 1 && auto.calls[0].qn === 64 && auto.calls[0].at > DEGRADE_AT && !auto.timersGrew,
@@ -1103,12 +1121,10 @@ async function scenarioSlowSegments() {
   check('11 当前源连续 3 片低于码率 → 不等卡顿，按新鲜测速主动切到够快的源',
     first && first.from === H('cosov') && first.at - run.t0 <= DEGRADE_AT + 30_000 && run.source !== H('cosov') &&
     run.stalls === 0 && run.minAhead >= 10 && !run.timersGrew, describeRun(run));
-  const legacy = legacySource();
-  if (legacy && legacy !== SCRIPT) {
-    const old = await degradeRun(legacy, { onlyCurrent: true, slowKbps: 150, minutes: 4 });
-    check('11 对照：旧版（origin/main）同场景要等缓冲见底、确认卡顿后才切',
-      old.stalls >= 1 && old.minAhead < 1, `旧版：卡顿 ${old.stalls} 次，降速后最低缓冲 ${old.minAhead.toFixed(1)}s；新版：卡顿 ${run.stalls} 次`);
-  }
+  await contrastRun('11 对照：旧版（origin/main）同场景要等缓冲见底、确认卡顿后才切', /switchOnSlowSegments/,
+    legacy => degradeRun(legacy, { onlyCurrent: true, slowKbps: 150, minutes: 4 }),
+    old => check('11 对照：旧版（origin/main）同场景要等缓冲见底、确认卡顿后才切',
+      old.stalls >= 1 && old.minAhead < 1, `旧版：卡顿 ${old.stalls} 次，降速后最低缓冲 ${old.minAhead.toFixed(1)}s；新版：卡顿 ${run.stalls} 次`));
   // 整体网速掉到 240（略低于码率，缓冲慢慢掉、不卡）：开播测速还新鲜时可能照着它试切，
   // 但刚连续跟不上的源不再选回（不 A↔B 横跳），测速过期后就停手；每次间隔 ≥60 秒。
   const all = await degradeRun(SCRIPT, { slowKbps: 240, minutes: 8 });
@@ -1177,12 +1193,10 @@ async function scenarioStartupQuick() {
   check('12 原始源慢：快筛一跑完就切到快源（不等精测），开播 60 秒 0 卡顿',
     run.quick.length === 1 && first.from === H('cosov') && first.to === H('08c') && first.at - run.t0 <= 6_000 &&
     run.stalls === 0 && run.source === H('08c') && !run.timersGrew, run.text);
-  const legacy = legacySource();
-  if (legacy && legacy !== SCRIPT) {
-    const old = await startupRun(legacy, { caps: slowOrig });
-    check('12 对照：旧版（origin/main）同场景要卡一次才切走', old.stalls >= 1 && run.stalls < old.stalls,
-      `旧版：${old.text}`);
-  }
+  await contrastRun('12 对照：旧版（origin/main）同场景要卡一次才切走', /applyStartupQuick/,
+    legacy => startupRun(legacy, { caps: slowOrig }),
+    old => check('12 对照：旧版（origin/main）同场景要卡一次才切走', old.stalls >= 1 && run.stalls < old.stalls,
+      `旧版：${old.text}`));
   // 精测照跑，并且能修正暂定结论：快筛后 08c 不计入限频，精测/卡顿/跟不上码率仍可随时切。
   const result = run.page.api.测速结果;
   check('12 精测照常跑完并确认快筛结论（不再多切一次）',
@@ -1193,10 +1207,9 @@ async function scenarioStartupQuick() {
   const fixAt = lie.log.find(item => item.from === H('hw'))?.at;
   check('12 快筛被头部缓存骗到 hw：暂定切换不占 60 秒限频，30 秒内被纠正，卡顿 ≤1 次',
     lie.quick[0]?.to === H('hw') && fixAt && fixAt - lie.quick[0].at <= 30_000 && lie.stalls <= 1 && lie.source !== H('hw'), lie.text);
-  if (legacy && legacy !== SCRIPT) {
-    const old = await startupRun(legacy, { caps: { [H('cosov')]: 120, [H('08c')]: 600 }, liarHead: 2 * MB, seconds: 120 });
-    check('12 对照：同一骗局旧版卡顿更多', old.stalls > lie.stalls, `旧版：${old.text}`);
-  }
+  await contrastRun('12 对照：同一骗局旧版卡顿更多', /applyStartupQuick/,
+    legacy => startupRun(legacy, { caps: { [H('cosov')]: 120, [H('08c')]: 600 }, liarHead: 2 * MB, seconds: 120 }),
+    old => check('12 对照：同一骗局旧版卡顿更多', old.stalls > lie.stalls, `旧版：${old.text}`));
   // 原始源够用（500 vs 08c 560，快不到 25%；快筛跑完时 cosov 真实分片不足 3 片，滞回兜不住，只能靠这道门槛）：不做暂定切换。暂停预载，确保快筛跑完、确实走到这道门槛。
   const fine = await startupRun(SCRIPT, { caps: { [H('cosov')]: 500, [H('08c')]: 560 }, paused: true });
   const fineProbed = fine.page.api.测速结果?.list.length;
@@ -1246,5 +1259,5 @@ await scenarioSlowSegments();
 await scenarioStartupQuick();
 if (CONTRAST) await contrast();
 const failed = results.filter(item => !item.pass);
-console.log(`\n=== qa-stall：PASS=${results.length - failed.length} FAIL=${failed.length}，耗时 ${((Date.now() - started) / 1000).toFixed(1)}s ===`);
+console.log(`\n=== qa-stall：PASS=${results.length - failed.length} FAIL=${failed.length}${skipped.length ? ` SKIP=${skipped.length}` : ''}，耗时 ${((Date.now() - started) / 1000).toFixed(1)}s ===`);
 process.exit(failed.length ? 1 : 0);
