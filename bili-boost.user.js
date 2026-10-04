@@ -858,18 +858,37 @@
     cdnState.switchLog.push({ at: cdnState.lastSwitchAt, from, to, why });
     if (cdnState.switchLog.length > 8) cdnState.switchLog.shift();
   }
+  // 只认 3 分钟内的证据：该源自己的真实分片，或本轮测速（整轮未过期）。健康档案/过期探测不算。
+  function freshScore(host, now = Date.now()) {
+    const realFresh = realSamples(host).length > 0 && now - (realRecord(host).at || 0) <= BITRATE_EVIDENCE_TTL;
+    const probesFresh = !!cdnState.lastResults && now - cdnState.lastResults.ts <= BITRATE_EVIDENCE_TTL;
+    const probe = probesFresh ? cdnState.lastResults.list.find(item => item.host === host) : null;
+    if (!realFresh && !probeEffective(probe)) return null;
+    const kbps = fusedKbps(host, probe);
+    return kbps == null ? null : { kbps, via: realFresh ? '真实分片' : '测速' };
+  }
+  // 自己最近连续 N 片跟不上码率、且之后没有新一轮测速证明它恢复了：主动切源时不选它（防 A↔B 横跳）。
+  function recentlySlow(host) {
+    const record = realRecord(host);
+    return !!record && record.below >= HYSTERESIS_SEGMENTS &&
+      !(cdnState.lastResults && cdnState.lastResults.ts > (record.at || 0));
+  }
   // 缓冲不足时只用已有数据（真实分片、上轮测速、健康档案）挑一个替代源，不发任何探测。
-  function decideFromData(key, current, { stall = false } = {}) {
+  // fresh：主动切源（还没卡）只认新鲜证据，候选须跟得上码率，当前源按最近 N 片真实分片算。
+  function decideFromData(key, current, { stall = false, fresh = false } = {}) {
     const bad = cdnState.rejected.get(key);
     const pool = compatibleHostPool().filter(host => host !== current &&
-      !isBanned(host) && !(bad && bad.has(host)));
+      !isBanned(host) && !(bad && bad.has(host)) && !(fresh && recentlySlow(host)));
     if (!pool.length) return null;
-    const scored = pool.map(host => ({ host, score: knownScore(host) })).filter(item => item.score)
+    const score = fresh ? freshScore : knownScore;
+    const scored = pool.map(host => ({ host, score: score(host) })).filter(item => item.score)
       .sort((a, b) => b.score.kbps - a.score.kbps || a.host.localeCompare(b.host));
-    const currentScore = knownScore(current);
+    const recent = realSamples(current).slice(-HYSTERESIS_SEGMENTS);
+    const currentScore = fresh && recent.length ? { kbps: median(recent) } : knownScore(current);
     if (scored.length) {
       const best = scored[0];
       if (!stall && currentScore && best.score.kbps < currentScore.kbps * MIN_GAIN) return null;
+      if (fresh && best.score.kbps < needKbps()) return null;
       return { host: best.host, via: best.score.via, kbps: best.score.kbps };
     }
     // 毫无数据：只有确认卡顿才按候选顺序盲切（历史结论：08c 常最快，排第一）。
@@ -1516,6 +1535,8 @@
     if (cdnState.perf.length > PERF_WINDOW) cdnState.perf.shift();
     noteRealSample(request.host, metrics.effectiveKbps);
     recordRealHealth(request.host, metrics.effectiveKbps);
+    // 先试主动切源，再判断码率告警：切走后新源真实分片不足 N 片，不会立刻告警/降档。
+    switchOnSlowSegments(request);
     if (!checkBitrateHeadroom()) noteRestoreSample(request.host, metrics.effectiveKbps);
     renderHud(false);
   }
@@ -2123,6 +2144,28 @@
       `（依据：${decision.via}${decision.kbps ? ' ' + decision.kbps + 'KB/s' : ''}；缓冲恢复后再补测）`);
     deferProbe(probeUrlFor(), '卡顿后补测');
     renderHud(false);
+  }
+
+  // 当前源连续 N 片真实分片低于码率（前向缓冲在掉、还没卡）：不等卡顿确认，用已有的新鲜数据切到够快的源。
+  // 不发探测、不加定时器；受 60 秒限频；用户手选的源不动；没有够快的新鲜候选就什么都不做（交给码率告警/补测）。
+  function switchOnSlowSegments(request) {
+    const key = request.key;
+    const current = currentCdnSource(key);
+    if (!current || request.host !== current || cdnState.manual.get(key)) return false;
+    if ((realRecord(current)?.below || 0) < HYSTERESIS_SEGMENTS) return false;
+    const decision = decideFromData(key, current, { fresh: true });
+    if (!decision) return false;
+    const held = switchBlockedReason(current, decision.host);
+    if (held) {
+      cdnState.held = { at: Date.now(), want: decision.host, keep: current, reason: held };
+      return false;
+    }
+    commitAutoSwitch(key, current, decision.host, '跟不上码率·' + decision.via);
+    if (cdnState.activeHost === current) cdnState.activeHost = null;
+    cdnState.perf.length = 0;
+    console.warn('[bili-cdn] 当前源连续', HYSTERESIS_SEGMENTS, '片低于码率 →', current, '改用', decision.host,
+      `（依据：${decision.via} ${decision.kbps}KB/s，需要 ${needKbps()}KB/s）`);
+    return true;
   }
 
   function onPotentialStall(event) {
