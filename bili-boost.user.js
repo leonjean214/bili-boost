@@ -2069,12 +2069,18 @@
         setHudEnabled(false);
         return;
       }
+      if (action === 'copy-diag') {
+        event.stopPropagation();
+        copyDiagnostics();
+        return;
+      }
       if (action === 'downgrade') {
         event.stopPropagation();
         setAutoDowngrade(!autoDowngrade);
         return;
       }
       hudExpanded = !hudExpanded;
+      diagNote = '';
       renderHud(false);
     };
     box.addEventListener('click', box.__onClick);
@@ -2183,14 +2189,132 @@
       `<span data-action="codec" style="color:#8cf">编码模块：${codecModeLabel()}（点击轮换）</span><br>` +
       (codecActive() ? `<span data-action="prefer" style="color:#8cf">编码偏好：${prefer === 'avc' ? 'H.264' : 'H.265'}（点击切换）</span><br>` : '') +
       `<span data-action="hud" style="color:#8cf">HUD：开（点击关闭）</span>` +
+      `<br><span data-action="copy-diag" style="color:#8cf">复制诊断 JSON（反馈问题时附上）</span>` +
+      (diagNote ? `<span style="color:#888"> · ${diagNote}</span>` : '') +
       `<hr style="border:0;border-top:1px solid #444;margin:5px 0">${cdnLine}`;
     if (expand) {
       clearTimeout(box.__collapseTimer);
       box.__collapseTimer = setTimeout(() => {
         hudExpanded = false;
+        diagNote = '';
         renderHud(false);
       }, 10000);
     }
+  }
+
+  // ---- 诊断报告：一键导出 JSON 供用户反馈 ----
+  // 只放 host、速度、计数等排障需要的字段。upos 分片 URL 的查询串里有签名（upsig/deadline/mid 等），
+  // 一律在序列化时剥掉；页面地址也只留路径和分 P，不带其它参数。
+  const DIAG_MAX_CHARS = 64 * 1024;
+  let diagNote = '';
+  function stripUrl(value) {
+    return value.replace(/\b(https?:\/\/[^\s?#"'<>]+)[?#][^\s"'<>]*/gi, '$1');
+  }
+  function diagReplacer(key, value) {
+    if (value instanceof URL) return value.origin + value.pathname;
+    if (value instanceof Map) return Object.fromEntries(value);
+    if (value instanceof Set) return [...value];
+    if (typeof value === 'string') return stripUrl(value);
+    if (typeof value === 'number' && !Number.isFinite(value)) return null;
+    return value;
+  }
+  const isoTime = ms => (Number.isFinite(ms) ? new Date(ms).toISOString() : null);
+  function buildDiagnostics() {
+    const page = (() => {
+      try {
+        const part = new URLSearchParams(location.search).get('p');
+        return { 路径: location.pathname, 分P: part || null, 顶层窗口: IS_TOP };
+      } catch (e) { return { 路径: null, 分P: null, 顶层窗口: IS_TOP }; }
+    })();
+    const results = cdnState.lastResults;
+    const report = {
+      格式: 'bili-boost-diag/1',
+      版本: SCRIPT_VERSION,
+      生成时间: isoTime(Date.now()),
+      页面: page,
+      环境: {
+        UA: String(navigator.userAgent || ''),
+        平台: String(navigator.platform || ''),
+        AV1硬解: debugApi.AV1硬解,
+        编码模块: codecModeLabel(),
+        编码偏好: prefer,
+      },
+      当前源: currentCdnSource(),
+      手动源: debugApi.手动源,
+      实测速度: debugApi.实测速度,
+      首字节延迟: debugApi.首字节延迟,
+      卡顿次数: cdnState.stalls,
+      诊断状态: debugApi.诊断状态,
+      真实速度: debugApi.真实速度,
+      分片明细: cdnState.perf.slice(-PERF_WINDOW),
+      切源记录: cdnState.switchLog.map(item => ({ ...item, at: isoTime(item.at) })),
+      滞回状态: cdnState.held ? { ...cdnState.held, at: isoTime(cdnState.held.at) } : null,
+      测速结果: results ? {
+        原因: results.why, 时间: isoTime(results.ts), 原始源: results.origHost, 胜出: results.win,
+        未完成精测: !!results.incomplete,
+        列表: results.list.map(result => ({
+          host: result.host, ok: probeSucceeded(result), kbps: result.kbps, effectiveKbps: result.effectiveKbps,
+          fusedKbps: result.fusedKbps, ttfb: result.ttfb, realSamples: result.realSamples,
+          stage: result.stage, note: result.note,
+          points: result.points?.map(point => ({ point: point.point, kbps: point.kbps, ttfb: point.ttfb, note: point.note })),
+        })),
+      } : null,
+      码率: debugApi.码率,
+      编码检测: debugApi.编码检测,
+      B站提供编码: codecState.offered.slice(),
+      已剔除AV1: codecState.stripped,
+      黑名单详情: debugApi.黑名单详情,
+      主机健康: debugApi.主机健康,
+      冲突: debugApi.冲突,
+    };
+    return report;
+  }
+  function diagnosticsJson() {
+    const report = buildDiagnostics();
+    let text = JSON.stringify(report, diagReplacer, 2);
+    if (text.length <= DIAG_MAX_CHARS) return text;
+    // 有界：切源记录/健康档案都已各自有上限，这里再兜一层。依次退成紧凑格式、省略大字段，始终是合法 JSON。
+    text = JSON.stringify(report, diagReplacer);
+    if (text.length <= DIAG_MAX_CHARS) return text;
+    report.主机健康 = '已省略（超长）';
+    report.测速结果?.列表.forEach(result => { delete result.points; });
+    report.已截断 = true;
+    text = JSON.stringify(report, diagReplacer);
+    if (text.length <= DIAG_MAX_CHARS) return text;
+    return JSON.stringify({ 格式: report.格式, 版本: report.版本, 生成时间: report.生成时间, 页面: report.页面,
+      当前源: report.当前源, 卡顿次数: report.卡顿次数, 诊断状态: report.诊断状态, 已截断: true }, diagReplacer);
+  }
+  // 复制到剪贴板。必须在点击回调里同步发起（Safari 只认用户手势内的剪贴板写入）。
+  function copyDiagnostics() {
+    const text = diagnosticsJson();
+    const legacyCopy = () => {
+      try {
+        if (!document.body || typeof document.execCommand !== 'function') return false;
+        const area = document.createElement('textarea');
+        area.value = text;
+        area.setAttribute?.('readonly', '');
+        area.style.cssText = 'position:fixed;left:-9999px;top:0;opacity:0';
+        document.body.appendChild(area);
+        area.select?.();
+        let ok = false;
+        try { ok = document.execCommand('copy') === true; } finally { area.remove?.(); }
+        return ok;
+      } catch (e) { return false; }
+    };
+    const done = ok => {
+      if (!ok) console.log('[bili-boost] 诊断 JSON（复制失败，请手动复制）：\n' + text);
+      diagNote = ok ? `已复制诊断 JSON（${text.length} 字符）` : '复制失败，诊断 JSON 已打印到控制台';
+      renderHud(false);
+      return diagNote;
+    };
+    let pending = null;
+    try {
+      if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+        pending = navigator.clipboard.writeText(text);
+      }
+    } catch (e) { pending = null; }
+    if (!pending || typeof pending.then !== 'function') return Promise.resolve(done(legacyCopy()));
+    return pending.then(() => done(true), () => done(legacyCopy()));
   }
 
   // ---- 调试接口：原 __biliCdn 八项保持不变，在其上增加编码字段 ----
@@ -2310,6 +2434,8 @@
     重新探测AV1() {
       return probeAv1Hw(true).then(r => r === null ? '探测失败，保持未知' : (r ? '本机有 AV1 硬解' : '本机无 AV1 硬解'));
     },
+    get 诊断报告() { return JSON.parse(diagnosticsJson()); },
+    复制诊断() { return copyDiagnostics(); },
     get 冲突() {
       return legacyConflict.detected ? {
         旧脚本: 'bili-cdn-fix',
