@@ -11,3 +11,6 @@
 !reviews/*.md
 !tools/*.sh
 !AGENTS.md
+!CHANGELOG.md
+!reviews/cloud-iter/
+!reviews/cloud-iter/*.md

@@ -197,7 +197,9 @@ function createPage(model, { hud = true, mediaCapabilities = 'safari', source = 
     const range = /bytes=(\d+)-(\d+)/.exec(init.headers?.Range || init.headers?.range || '');
     const offset = range ? Number(range[1]) : 0;
     const size = range ? Number(range[2]) - offset + 1 : FILE_BYTES;
-    const status = model.status ? model.status(url.hostname, !!range) : (range ? 206 : 200);
+    const status = !isProbe && model.segmentStatus && !(model.segmentStatus(url.hostname, clock.now) >= 200 &&
+      model.segmentStatus(url.hostname, clock.now) < 300) ? model.segmentStatus(url.hostname, clock.now)
+      : model.status ? model.status(url.hostname, !!range) : (range ? 206 : 200);
     const record = { host: url.hostname, offset, size, at: clock.now, video: video && {
       paused: video.paused, time: video.currentTime, ahead: Math.max(0, video.bufferedEnd - video.currentTime) } };
     if (isProbe) {
@@ -233,6 +235,14 @@ function createPage(model, { hud = true, mediaCapabilities = 'safari', source = 
       const entry = { host: url.hostname, path: url.pathname, offset, size, startedAt: clock.now, loaded: 0, endedAt: null };
       net.segments.push(entry);
       this.contentRange = `bytes ${offset}-${offset + size - 1}/${FILE_BYTES}`;
+      // 真实分片的 HTTP 状态（如 akam/镜像 403）：XHR 照常 load/loadend，只是 status 非 2xx、没有数据。
+      const status = model.segmentStatus ? model.segmentStatus(url.hostname, clock.now) : 206;
+      this.status = status;
+      entry.status = status;
+      if (status < 200 || status >= 300) {
+        clock.setTimeout(() => { entry.endedAt = clock.now; this.emitLocal('loadend', { loaded: 0 }); }, ttfbOf(url.hostname));
+        return;
+      }
       const step = () => {
         if (this.aborted) { entry.endedAt = clock.now; this.emitLocal('loadend', { loaded: entry.loaded }); return; }
         if (entry.loaded >= size) {
@@ -612,6 +622,85 @@ async function scenarioCodec() {
   noPlayurl.stopPlayback();
 }
 
+// 探测时 08c 最快（测速请求正常），可播放器的真实分片在 08c 上一律 403（现场 akam/签名不认 host 的情形）。
+const FORBIDDEN_MODEL = {
+  speed: host => (host === H('08c') ? 900 : 400),
+  segmentStatus: host => (host === H('08c') ? 403 : 206),
+};
+
+async function scenarioSegmentForbidden(source = SCRIPT, label = '') {
+  const page = createPage(FORBIDDEN_MODEL, { hud: true, source });
+  page.setPlayinfo();
+  page.startPlayback({ host: H('cosov') });
+  await page.clock.advance(90_000);
+  const segs = page.net.segments;
+  const forbidden = segs.filter(seg => seg.status === 403);
+  const firstFail = forbidden[0];
+  const recovered = firstFail && segs.find(seg => seg.startedAt > firstFail.startedAt && seg.status === 206 && seg.loaded >= seg.size);
+  const out = { forbidden: forbidden.length, stalls: page.api.卡顿次数, played: page.video.currentTime,
+    recoverMs: recovered ? recovered.endedAt - firstFail.endedAt : null };
+  if (label) { page.stopPlayback(); return out; }
+  const api = page.api;
+  const ban = api.黑名单详情?.find(item => item.host === H('08c'));
+  check('6 真实分片 403 → 立即拉黑该源（不等卡顿确认）', forbidden.length >= 1 && forbidden.length <= 2 &&
+    api.黑名单.includes(H('08c')) && /分片 HTTP 403/.test(ban?.原因 || ''),
+    `403 次数=${forbidden.length}；黑名单=${JSON.stringify(api.黑名单详情)}`);
+  check('6 拉黑后播放器重试直接回到原始源，播放不断', recovered && recovered.host === H('cosov') &&
+    out.recoverMs < 2_000 && page.player.xhrs.every(xhr => !xhr.aborted) && out.played > 80,
+    `回退到 ${recovered?.host}，失败→成功 ${out.recoverMs}ms，播放到 ${out.played}s，卡顿 ${out.stalls}，abort=${page.net.xhrAborts}`);
+  check('6 HUD/debug 当前源不再是 403 源，切源记录写明原因', !page.hudText().split('\n')[0].includes('08c') &&
+    api.当前源 !== H('08c') && api.切源记录.some(item => /HTTP 403/.test(item.why)),
+    `debug=${api.当前源} HUD=${JSON.stringify(page.hudText().split('\n')[0])} 记录=${JSON.stringify(api.切源记录.map(item => item.why))}`);
+  const health = api.主机健康[shortHost(H('08c'))] || '';
+  check('6 403 计入主机健康（失败样本）', /\d+\/\d+ 成功/.test(health) &&
+    Number(/^(\d+)\/(\d+)/.exec(health)?.[1]) < Number(/^(\d+)\/(\d+)/.exec(health)?.[2]), health);
+  page.stopPlayback();
+}
+
+const shortHost = host => host.replace(/^upos-[a-z]{2}-(mirror|upcdn)?/, '').split('.')[0];
+
+async function scenarioBanRecovery() {
+  // 不播放，直接用 fetch 分片驱动：手选 08c → 分片被改写到 08c → 403 → 拉黑。看禁期、到期恢复与翻倍。
+  const page = createPage(FORBIDDEN_MODEL, { hud: false });
+  page.setPlayinfo();
+  page.attachVideo();
+  const api = page.api;
+  const segUrl = `https://${H('cosov')}${VIDEO_PATH}?e=sig`;
+  const fetchSeg = async () => {
+    const pending = page.sandbox.fetch(segUrl, { headers: { Range: 'bytes=0-524287' } });
+    await page.clock.advance(1_000);
+    return pending;
+  };
+  await fetchSeg();                                   // 先让脚本认识这个媒体
+  await page.clock.advance(60_000);                   // 开播测速收尾
+  const durations = [];
+  const fail = async () => {
+    api.手动选源(H('08c'));
+    const res = await fetchSeg();
+    const ban = api.黑名单详情.find(item => item.host === H('08c'));
+    durations.push({ status: res.status, left: ban?.剩余秒, strikes: ban?.次数 });
+  };
+  await fail();
+  const firstBan = api.黑名单.includes(H('08c'));
+  await page.clock.advance(2 * 60_000 + 1_000);
+  const recovered = !api.黑名单.includes(H('08c'));
+  for (let i = 0; i < 5; i++) { await fail(); await page.clock.advance(1_000); }
+  const lefts = durations.map(item => item.left);
+  check('6 黑名单到期自动恢复（首次 2 分钟）', firstBan && recovered && lefts[0] > 110 && lefts[0] <= 120,
+    `首次禁 ${lefts[0]}s，2 分钟后仍在黑名单=${!recovered}`);
+  check('6 连续再犯禁期翻倍且封顶 30 分钟（手选可立即解禁、不清次数）',
+    lefts.slice(1).every((left, i) => left > Math.min(1800, 120 * 2 ** (i + 1)) - 15 && left <= Math.min(1800, 120 * 2 ** (i + 1))) &&
+    durations.every(item => item.status === 403) && durations.at(-1).strikes === 6,
+    `禁期(s)=${lefts.join('/')} 次数=${durations.map(item => item.strikes).join('/')}`);
+  // 最后一次禁期结束后 1 小时内没再出错 → 次数清零，下次又从 2 分钟起。
+  await page.clock.advance(30 * 60_000 + 61 * 60_000);
+  await fail();
+  check('6 长时间无故障后失败次数清零', durations.at(-1).strikes === 1 && durations.at(-1).left <= 120,
+    JSON.stringify(durations.at(-1)));
+  const state = api.诊断状态;
+  check('6 黑名单有界（≤64）', state.blacklist <= 64, `blacklist=${state.blacklist}`);
+}
+
 async function contrast() {
   let legacy;
   try {
@@ -624,6 +713,10 @@ async function contrast() {
   console.log(`对照 1（头部缓存场景）：旧版选 ${old.cursor.win}（测速峰值并发 ${old.cursor.peak}），v1.7.0 选 ${now.cursor.win}`);
   const oldFlap = await scenarioFlapping(legacy, 'legacy');
   const newFlap = await scenarioFlapping(SCRIPT, 'current');
+  const oldForbid = await scenarioSegmentForbidden(legacy, 'legacy');
+  const newForbid = await scenarioSegmentForbidden(SCRIPT, 'current');
+  console.log(`对照 6（真实分片 403，90 秒）：旧版 403 ${oldForbid.forbidden} 次 / 卡顿 ${oldForbid.stalls} / 播放到 ${oldForbid.played}s；` +
+    `新版 403 ${newForbid.forbidden} 次 / 卡顿 ${newForbid.stalls} / 播放到 ${newForbid.played}s`);
   console.log(`对照 2/3（抖动 6 分钟）：旧版 探测 ${oldFlap.probes} 次 / 缓冲不足时 ${oldFlap.lowBufferProbes} 次 / 卡顿 ${oldFlap.stalls} / 并发峰值 ${oldFlap.peak}；` +
     `v1.7.0 探测 ${newFlap.probes} 次 / 缓冲不足时 ${newFlap.lowBufferProbes} 次 / 卡顿 ${newFlap.stalls} / 并发峰值 ${newFlap.peak}`);
 }
@@ -636,6 +729,8 @@ await scenarioLowBuffer();
 await scenarioHungProbe();
 await scenarioBitrate();
 await scenarioCodec();
+await scenarioSegmentForbidden();
+await scenarioBanRecovery();
 if (CONTRAST) await contrast();
 const failed = results.filter(item => !item.pass);
 console.log(`\n=== qa-stall：PASS=${results.length - failed.length} FAIL=${failed.length}，耗时 ${((Date.now() - started) / 1000).toFixed(1)}s ===`);

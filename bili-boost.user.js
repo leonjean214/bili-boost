@@ -276,7 +276,8 @@
 
   // 两个模块的状态严格隔离。全局坏源/赢家沿用会话语义，其余按媒体重置。
   const cdnState = {
-    blacklist: new Set(),
+    // host → { until, strikes, reason, at }：带期限的黑名单，到期自动恢复（见 banHost）。
+    blacklist: new Map(),
     rejected: new Map(),
     picked: new Map(),
     manual: new Map(),
@@ -620,10 +621,26 @@
   const currentCdnSource = (key = cdnState.curKey) => key
     ? (cdnState.manual.get(key) || cdnState.activeHost || cdnState.picked.get(key) || null)
     : cdnState.lastWinner;
-  function addToBoundedSet(set, value, max = 64) {
-    if (set.has(value)) set.delete(value);
-    set.add(value);
-    while (set.size > max) set.delete(set.values().next().value);
+  // 黑名单带期限（半衰期恢复）：首次 2 分钟，到期后 1 小时内再犯则翻倍，最多 30 分钟。
+  // 以前一次 403/连不上就整页会话永久拉黑；akam 这类“时好时坏”的源从此再无机会，
+  // B站是 SPA，一个标签页连看几小时很常见。到期只是恢复候选资格，仍要重新测速/实测才会被选中。
+  const BAN_BASE_MS = 2 * 60e3;
+  const BAN_MAX_MS = 30 * 60e3;
+  const BAN_STRIKE_MEMORY = 60 * 60e3;
+  const BAN_MAX_HOSTS = 64;
+  function isBanned(host, now = Date.now()) {
+    const entry = cdnState.blacklist.get(host);
+    return !!entry && entry.until > now;
+  }
+  function banHost(host, reason, now = Date.now()) {
+    const prev = cdnState.blacklist.get(host);
+    if (prev && prev.until > now) return prev;   // 同一禁期内的并发失败不重复加码
+    const strikes = prev && now - prev.until < BAN_STRIKE_MEMORY ? prev.strikes + 1 : 1;
+    const entry = { until: now + Math.min(BAN_MAX_MS, BAN_BASE_MS * 2 ** (strikes - 1)), strikes, reason, at: now };
+    cdnState.blacklist.delete(host);
+    cdnState.blacklist.set(host, entry);
+    while (cdnState.blacklist.size > BAN_MAX_HOSTS) cdnState.blacklist.delete(cdnState.blacklist.keys().next().value);
+    return entry;
   }
   function clearCdnCache(key) {
     try { sessionStorage.removeItem('biliCdn:' + key); } catch (e) { }
@@ -745,7 +762,7 @@
   function decideFromData(key, current, { stall = false } = {}) {
     const bad = cdnState.rejected.get(key);
     const pool = compatibleHostPool().filter(host => host !== current &&
-      !cdnState.blacklist.has(host) && !(bad && bad.has(host)));
+      !isBanned(host) && !(bad && bad.has(host)));
     if (!pool.length) return null;
     const scored = pool.map(host => ({ host, score: knownScore(host) })).filter(item => item.score)
       .sort((a, b) => b.score.kbps - a.score.kbps || a.host.localeCompare(b.host));
@@ -882,7 +899,7 @@
           note: `Range 不可用(HTTP ${res.status})` };
       }
       if (!res.ok || !res.body) {
-        addToBoundedSet(cdnState.blacklist, host);
+        banHost(host, '测速 HTTP ' + res.status);
         return { host, ok: false, kbps: 0, ttfb: Math.round(performance.now() - started), point,
           note: 'HTTP ' + res.status };
       }
@@ -914,7 +931,7 @@
         return { host, ok: false, skipped: true, kbps: 0, ttfb: Math.round(ended - started), point,
           note: 'Range 请求失败' };
       }
-      if (offset === 0 && e.name !== 'AbortError') addToBoundedSet(cdnState.blacklist, host);
+      if (offset === 0 && e.name !== 'AbortError') banHost(host, '测速连接失败');
       const metrics = got >= 32768
         ? probeMetrics(got, firstChunkBytes, started, firstAt, ended)
         : { kbps: 0, effectiveKbps: 0, ttfb: firstAt == null ? Math.round(ended - started) : Math.round(firstAt - started), deliveryMs: Infinity };
@@ -994,7 +1011,7 @@
       const origHost = url.hostname;
       const bad = cdnState.rejected.get(key) || new Set();
       const pool = compatibleHostPool(origHost).filter(host =>
-        !cdnState.blacklist.has(host) && !bad.has(host)
+        !isBanned(host) && !bad.has(host)
       );
       if (!pool.length) return;
       const ahead = aheadPoint(url);
@@ -1024,7 +1041,7 @@
         if (!idle) incomplete = true;
         else for (const finalist of finalists) {
           const latestBad = cdnState.rejected.get(key);
-          if (cdnState.blacklist.has(finalist.host) || (latestBad && latestBad.has(finalist.host))) continue;
+          if (isBanned(finalist.host) || (latestBad && latestBad.has(finalist.host))) continue;
           if (blocked()) { incomplete = true; break; }
           const result = await probePrecision(url, finalist.host, aheadPoint(url), epoch, blocked);
           if (!alive()) return;
@@ -1040,7 +1057,7 @@
       // 精测没跑完（缓冲不足）时只用已有数据：快筛与真实分片融合后决策。
       const latestBad = cdnState.rejected.get(key);
       const eligible = (incomplete ? merged : full).filter(result => probeSucceeded(result) &&
-        !cdnState.blacklist.has(result.host) && !(latestBad && latestBad.has(result.host))).sort(compareHosts);
+        !isBanned(result.host) && !(latestBad && latestBad.has(result.host))).sort(compareHosts);
       const best = eligible[0];
       if (!best || !alive()) return;
       const manualHost = cdnState.manual.get(key);
@@ -1055,7 +1072,7 @@
       if (win !== inUse && !manual && !manualHost) {
         // 在用源本轮探测失败/已被拉黑才算“坏源”；只是还没测到（缓冲不足提前收工）不算。
         const inUseResult = merged.find(result => result.host === inUse);
-        const fromFailed = cdnState.blacklist.has(inUse) || !!(latestBad && latestBad.has(inUse)) ||
+        const fromFailed = isBanned(inUse) || !!(latestBad && latestBad.has(inUse)) ||
           (!!inUseResult && !probeSucceeded(inUseResult));
         held = switchBlockedReason(inUse, win, { fromFailed });
         if (held) win = inUse;
@@ -1098,7 +1115,9 @@
   function selectManualSource(host) {
     const key = cdnState.curKey;
     if (!key || !compatibleHostPool().includes(host)) return '只能选择当前媒体的兼容源';
-    cdnState.blacklist.delete(host);
+    // 手选优先于黑名单：立即解禁，但保留失败次数，手选源再出错时禁期继续翻倍。
+    const ban = cdnState.blacklist.get(host);
+    if (ban) ban.until = Math.min(ban.until, Date.now());
     cdnState.rejected.get(key)?.delete(host);
     cdnState.manual.set(key, host);
     cdnState.picked.set(key, host);
@@ -1184,7 +1203,7 @@
     }
 
     const bad = cdnState.rejected.get(key);
-    if (target && (cdnState.blacklist.has(target) || (bad && bad.has(target)))) {
+    if (target && (isBanned(target) || (bad && bad.has(target)))) {
       target = null;
       cdnState.manual.delete(key);
       cdnState.picked.delete(key);
@@ -1204,7 +1223,7 @@
       }
       target = cdnState.lastWinner;
       if (target && canRewriteHost(url.hostname, target) &&
-          !cdnState.blacklist.has(target) && !(bad && bad.has(target))) {
+          !isBanned(target) && !(bad && bad.has(target))) {
         // 记录测速完成前使用的会话赢家，让真实卡顿可以立即淘汰它。
         cdnState.picked.set(key, target);
       } else {
@@ -1348,6 +1367,46 @@
   const XHR_PLAYINFO_PASSIVE = Symbol('biliBoostPlayinfoPassive');
   const origSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
 
+  // 真实分片在脚本改写到的源上返回 403/404/410/5xx（akam 时好时坏、签名不认该 host）：
+  // 不等卡顿确认，立刻限期拉黑该源、撤掉本媒体的改写，播放器自己的重试就回到 B站给的原始源。
+  // 只处理“我们改写过”的请求：原始源出错是播放器自己的事，脚本不插手；从不 abort 播放器请求。
+  function hostOfRaw(raw) {
+    try { return new URL(String(raw), location.href).hostname; } catch (e) { return null; }
+  }
+  function isSegmentHttpFailure(status) {
+    return status === 403 || status === 404 || status === 410 || (status >= 500 && status < 600);
+  }
+  function onSegmentHttpFailure(request, status) {
+    if (!request.rewrittenFrom || request.generation !== mediaGeneration || !isSegmentHttpFailure(status)) return;
+    const host = request.host;
+    const key = request.key;
+    const already = isBanned(host);
+    const entry = banHost(host, `分片 HTTP ${status}`);
+    if (!already) {
+      recordProbe({ host, ok: false, kbps: 0 });
+      saveHealth();
+    }
+    if (!cdnState.rejected.has(key)) cdnState.rejected.set(key, new Set());
+    cdnState.rejected.get(key).add(host);
+    if (cdnState.manual.get(key) === host) cdnState.manual.delete(key);
+    if (cdnState.picked.get(key) === host) cdnState.picked.delete(key);
+    clearCdnCache(key);
+    if (cdnState.lastWinner === host) {
+      cdnState.lastWinner = null;
+      try { localStorage.removeItem('biliCdnWinner'); } catch (e) { }
+    }
+    if (cdnState.activeHost === host) cdnState.activeHost = null;
+    if (already) return;
+    // 原始源只是保底；缓冲恢复后按常规门控补测一次，找有没有比原始源更好的未拉黑源。
+    if (!cdnState.pendingProbe) deferProbe(probeUrlFor(), '分片失败后补测');
+    // 硬失败不受 60 秒切源限频约束，也不占用限频额度（不改 lastSwitchAt），只记账便于排查。
+    cdnState.switchLog.push({ at: Date.now(), from: host, to: request.rewrittenFrom, why: `分片 HTTP ${status}·拉黑` });
+    if (cdnState.switchLog.length > 8) cdnState.switchLog.shift();
+    console.warn('[bili-cdn] 真实分片 HTTP', status, '→ 拉黑', host, Math.round((entry.until - Date.now()) / 60e3), '分钟，回退原始源',
+      request.rewrittenFrom);
+    renderHud(false);
+  }
+
   function recordRealTransfer(request, got, started, firstAt, firstChunkBytes, ended, via) {
     if (request.generation !== mediaGeneration || request.key !== cdnState.curKey ||
         got <= 65536 || ended - started <= 50) return;
@@ -1370,7 +1429,7 @@
     if (required && realSamples(current).length >= HYSTERESIS_SEGMENTS) {
       const hosts = new Set([...compatibleHostPool(), ...cdnState.real.keys()]);
       for (const host of hosts) {
-        if (cdnState.blacklist.has(host)) continue;
+        if (isBanned(host)) continue;
         const value = fusedKbps(host, cdnState.lastResults?.list.find(item => item.host === host));
         if (value == null) continue;
         measured++;
@@ -1482,6 +1541,7 @@
       const url = looksLikeMediaRaw(out) ? new URL(out, location.href) : null;
       if (url && isMedia(url)) this[XHR_CDN] = {
         host: url.hostname, url, key: keyOf(url), generation: mediaGeneration,
+        rewrittenFrom: out !== rawUrl ? hostOfRaw(rawUrl) : null,
       };
     } catch (e) { }
     return origOpen.call(this, method, out, ...rest);
@@ -1514,6 +1574,12 @@
           const total = /\/(\d+)\s*$/.exec(this.getResponseHeader('content-range') || '');
           if (total) noteTotal(cdnRequest.url.pathname, Number(total[1]));
         } catch (e) { }
+        let status = 0;
+        try { status = this.status; } catch (e) { }
+        if (isSegmentHttpFailure(status)) {
+          onSegmentHttpFailure(cdnRequest, status);
+          return;
+        }
         recordRealTransfer(cdnRequest, event.loaded, started, firstAt, firstLoaded,
           performance.now(), 'xhr');
       }, { once: true });
@@ -1588,11 +1654,17 @@
       notePlayRequest(originalUrl);
       suppressStallChecks(STALL_LOAD_GRACE);
     }
+    let rewrittenFrom = null;
     if (typeof input === 'string' || input instanceof URL) {
+      const before = String(input);
       input = rewriteSegmentUrl(input);
+      if (String(input) !== before) rewrittenFrom = hostOfRaw(before);
     } else if (input instanceof Request) {
       const rewritten = rewriteSegmentUrl(input.url);
-      if (rewritten !== input.url) input = new Request(rewritten, input);
+      if (rewritten !== input.url) {
+        rewrittenFrom = hostOfRaw(input.url);
+        input = new Request(rewritten, input);
+      }
     }
     let cdnRequest = null;
     try {
@@ -1600,13 +1672,17 @@
       const requestUrl = looksLikeMediaRaw(rawRequestUrl) ? new URL(rawRequestUrl, location.href) : null;
       const method = String(init?.method || (input instanceof Request ? input.method : 'GET')).toUpperCase();
       if (requestUrl && method === 'GET' && isMedia(requestUrl)) {
-        cdnRequest = { host: requestUrl.hostname, url: requestUrl, key: keyOf(requestUrl), generation: mediaGeneration };
+        cdnRequest = { host: requestUrl.hostname, url: requestUrl, key: keyOf(requestUrl), generation: mediaGeneration,
+          rewrittenFrom };
         noteCursor(requestUrl, rangeHeaderOf(input, init));
       }
     } catch (e) { }
     const started = cdnRequest ? performance.now() : 0;
     const response = await origFetch.call(this, input, init);
-    if (cdnRequest) observeFetchSegment(response, cdnRequest, started);
+    if (cdnRequest) {
+      if (isSegmentHttpFailure(response.status)) onSegmentHttpFailure(cdnRequest, response.status);
+      else observeFetchSegment(response, cdnRequest, started);
+    }
     if (playerData && !codecActive()) {
       try { response.clone().json().then(notePlayinfoBitrates, () => { }); } catch (e) { }
     }
@@ -2178,7 +2254,14 @@
     },
     get 测速结果() { return cdnState.lastResults; },
     get 卡顿次数() { return cdnState.stalls; },
-    get 黑名单() { return [...cdnState.blacklist]; },
+    get 黑名单() { const now = Date.now(); return [...cdnState.blacklist.keys()].filter(host => isBanned(host, now)); },
+    get 黑名单详情() {
+      const now = Date.now();
+      return [...cdnState.blacklist].map(([host, entry]) => ({
+        host, 原因: entry.reason, 次数: entry.strikes,
+        剩余秒: Math.max(0, Math.ceil((entry.until - now) / 1000)),
+      }));
+    },
     重测() {
       if (cdnState.lastProbeUrl) {
         cdnState.manual.delete(cdnState.curKey);
