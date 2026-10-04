@@ -74,6 +74,8 @@
   const FALLBACK_AHEAD_OFFSET = 4 * 1024 * 1024;  // 还不知道播放器读到哪时的前方测速点
   const FALLBACK_REQUIRED_KBPS = 400; // playurl 未给码率时的保守需求（约 1080P）
   const BITRATE_HEADROOM = 1.2;
+  // 码率告警只认新鲜数据：其他源超过 3 分钟没有新的测速/真实分片，就不再凭旧数字撑住“还有源够快”。
+  const BITRATE_EVIDENCE_TTL = 180e3;
   const REAL_SAMPLES_MAX = 8;
   const REAL_WEIGHT_FEW = 0.6;       // 有 1~2 片真实数据时真实速度权重
   const REAL_WEIGHT_MANY = 0.8;      // 有 ≥N 片时
@@ -774,6 +776,7 @@
       while (cdnState.real.size > 16) cdnState.real.delete(cdnState.real.keys().next().value);
     }
     record.samples.push(effectiveKbps);
+    record.at = Date.now();
     if (record.samples.length > REAL_SAMPLES_MAX) record.samples.shift();
     record.below = effectiveKbps < needKbps() ? record.below + 1 : 0;
   }
@@ -1524,18 +1527,37 @@
     const current = currentCdnSource();
     let best = 0;
     let measured = 0;
+    let stale = 0;
+    let staleBest = 0;
     if (required && realSamples(current).length >= HYSTERESIS_SEGMENTS) {
+      const now = Date.now();
+      // 测速结果整轮过期后不再参与（缓冲不足禁测时，旧探测值可能一直挂着）；当前源始终按自己的真实分片算。
+      const probesFresh = !!cdnState.lastResults && now - cdnState.lastResults.ts <= BITRATE_EVIDENCE_TTL;
       const hosts = new Set([...compatibleHostPool(), ...cdnState.real.keys()]);
       for (const host of hosts) {
         if (isBanned(host)) continue;
-        const value = fusedKbps(host, cdnState.lastResults?.list.find(item => item.host === host));
+        const probe = cdnState.lastResults?.list.find(item => item.host === host);
+        const realFresh = realSamples(host).length > 0 && now - (realRecord(host).at || 0) <= BITRATE_EVIDENCE_TTL;
+        if (host !== current && !realFresh && !probesFresh) {
+          const old = fusedKbps(host, probe);
+          if (old != null) { stale++; staleBest = Math.max(staleBest, old); }
+          continue;
+        }
+        const value = fusedKbps(host, probesFresh ? probe : null);
         if (value == null) continue;
         measured++;
         best = Math.max(best, value);
       }
     }
-    const warn = measured > 0 && best < required * BITRATE_HEADROOM;
-    bitrateState.warn = warn ? { required, best, hosts: measured, at: Date.now() } : null;
+    let warn = measured > 0 && best < required * BITRATE_HEADROOM;
+    if (warn && staleBest >= required * BITRATE_HEADROOM) {
+      // 只有过期数据说“还有源够快”：先补测一轮（照常受冷却和缓冲门控），补测会刷新数据并按滞回决定是否切源。
+      // 补测在跑、或缓冲还够补测时先等新数据；缓冲已不足 15 秒（禁测）就不再信旧数字，照常告警。
+      if (!cdnState.pendingProbe && !cdnState.probing.size) deferProbe(probeUrlFor(), '旧测速过期，补测');
+      if (cdnState.pendingProbe) maybeRunDeferredProbe();
+      if (cdnState.probing.size || !probeBlockedByBuffer()) warn = false;
+    }
+    bitrateState.warn = warn ? { required, best, hosts: measured, stale, at: Date.now() } : null;
     if (warn && autoDowngrade) maybeDowngrade();
     return warn;
   }
@@ -2302,7 +2324,8 @@
       (cdnState.stalls ? ` · <span style="color:#f66">卡顿 ${cdnState.stalls}</span>` : ' · 卡顿 0');
     const warn = bitrateState.warn;
     const bitrateLine = warn
-      ? `<span style="color:#f96">⚠️ 所有源都 &lt; 1.2×码率：需 ${warn.required} KB/s，最快约 ${warn.best} KB/s${autoDowngrade ? '' : '，建议降一档清晰度'}</span>`
+      ? `<span style="color:#f96">⚠️ 所有源都 &lt; 1.2×码率：需 ${warn.required} KB/s，最快约 ${warn.best} KB/s` +
+        `${warn.stale ? `（另有 ${warn.stale} 个源超过 3 分钟没有新数据，未计入）` : ''}${autoDowngrade ? '' : '，建议降一档清晰度'}</span>`
       : '';
     const [status, statusColor] = efficiencyText();
     const reason = codecReasonText();
