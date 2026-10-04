@@ -106,7 +106,7 @@ function abortError() {
 }
 
 // 一个模拟页面：真实脚本 + 模拟网络/播放器。model 决定每个 host 在每个字节位置的速度。
-function createPage(model, { hud = true, mediaCapabilities = 'safari', source = SCRIPT } = {}) {
+function createPage(model, { hud = true, mediaCapabilities = 'safari', source = SCRIPT, seed = null } = {}) {
   const clock = new Clock();
   const logs = [];
   const net = {
@@ -263,6 +263,8 @@ function createPage(model, { hud = true, mediaCapabilities = 'safari', source = 
   }
 
   const localStorage = new Storage();
+  // seed：上一个“会话”留下的 localStorage（跨会话测试用），在脚本加载前写入。
+  for (const [key, value] of Object.entries(seed || {})) localStorage.setItem(key, value);
   if (!hud) localStorage.setItem('bhw_hud', 'false');
   // AV1 能力已缓存为“无”，与 M2 Mac 一致；脚本不会在加载时再发能力查询。
   const env = ['QA-Safari', 'MacIntel', 8].join('|');
@@ -767,6 +769,132 @@ async function scenarioDiagnostics() {
     /已打印到控制台/.test(message2), `收起清空=${cleared} 控制台=${printed}；${message} / ${message2}`);
 }
 
+// 实播指标闭环：上次会话的真实分片速度/卡顿写进健康档案，下次开播（本会话还没有真实分片）作为先验。
+// 现场：cosov 探测永远命中缓存（5000KB/s），真实分片只有 150KB/s。无先验时开播首轮必选 cosov（场景 1 的 firstWin）。
+const CACHE_LIE_MODEL = {
+  speed(host, offset, kind) {
+    if (host === H('cosov')) return kind === 'probe' ? 5000 : 150;
+    if (host === H('08c')) return 900;
+    return 250;
+  },
+};
+function readHealth(page) {
+  try { return JSON.parse(page.sandbox.localStorage.getItem('bhw_health') || 'null'); } catch { return null; }
+}
+async function openRound(seed, source = SCRIPT) {
+  const page = createPage(CACHE_LIE_MODEL, { hud: false, seed, source });
+  page.setPlayinfo();
+  page.attachVideo();
+  page.video.paused = true;
+  // 开播触发用一个 8MB 的大分片（150KB/s 下 30 秒内传不完）：首轮决策只能依据探测 + 先验，不混入本会话真实分片。
+  const xhr = new page.sandbox.XMLHttpRequest();
+  xhr.open('GET', `https://${H('cosov')}${VIDEO_PATH}?e=sig`);
+  xhr.setRequestHeader('Range', `bytes=0-${8 * MB - 1}`);
+  xhr.send();
+  await page.clock.advance(30_000);
+  return { page, result: page.api.测速结果 };
+}
+function legacySource() {
+  for (const ref of ['origin/main', 'main']) {
+    try {
+      return execFileSync('git', ['show', `${ref}:bili-boost.user.js`], {
+        cwd: new URL('..', import.meta.url), encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+    } catch { }
+  }
+  return null;
+}
+async function scenarioRealPrior() {
+  // 会话 1：手选 cosov，在暂停态拉 6 片真实分片（间隔 8 秒，跨过 30 秒落盘节流）。
+  const s1 = createPage(CACHE_LIE_MODEL, { hud: false });
+  s1.setPlayinfo();
+  s1.attachVideo();
+  s1.video.paused = true;
+  s1.player.host = H('cosov');
+  const timersBefore = s1.clock.timers.size;
+  for (let i = 0; i < 6; i++) {
+    s1.api.手动选源(H('cosov'));
+    s1.requestSegment();
+    await s1.clock.advance(8_000);
+  }
+  await s1.clock.advance(60_000);
+  const stored = readHealth(s1);
+  const cosov = stored?.hosts?.[H('cosov')];
+  check('8 真实分片速度写进健康档案（有界、节流落盘、不新增定时器）', stored?.version === 2 && cosov?.realN >= 3 &&
+    cosov.real > 100 && cosov.real < 200 && Object.keys(stored.hosts).length <= 32 && s1.clock.timers.size <= timersBefore + 1,
+    `cosov 实播=${cosov?.real}KB/s×${cosov?.realN} 片，卡顿=${cosov?.stalls}；定时器 ${timersBefore} → ${s1.clock.timers.size}`);
+
+  // 会话 2：只继承健康档案（不继承全局赢家），开播首轮：探测仍说 cosov 5000，先验把它压下去。
+  const seed = { bhw_health: s1.sandbox.localStorage.getItem('bhw_health') };
+  const fresh = await openRound(null);
+  const primed = await openRound(seed);
+  const primedCosov = primed.result?.list.find(item => item.host === H('cosov'));
+  check('8 下次开播：先验压过被缓存抬高的探测，不再选 cosov（对照：无先验选 cosov）',
+    fresh.result?.win === H('cosov') && primed.result?.win === H('08c') && primedCosov?.priorKbps > 100 &&
+    primedCosov.priorKbps < 200 && primedCosov.fusedKbps < 500 && primedCosov.effectiveKbps > 1000,
+    `无先验选=${fresh.result?.win}；有先验 cosov 探测=${primedCosov?.effectiveKbps} 先验=${primedCosov?.priorKbps} → 融合=${primedCosov?.fusedKbps}，选=${primed.result?.win}`);
+  const healthLine = primed.page.api.主机健康[primed.page.api.诊断报告 ? 'cosov' : 'cosov'] ||
+    Object.entries(primed.page.api.主机健康).find(([name]) => /cosov/.test(name))?.[1];
+  check('8 主机健康/诊断报告展示实播与先验', /实播 \d+KB\/s×\d+ 片 卡顿 \d+（先验 \d+KB\/s）/.test(healthLine || '') &&
+    primed.page.api.诊断报告.测速结果?.列表?.some(item => item.host === H('cosov') && item.priorKbps === primedCosov?.priorKbps),
+    healthLine);
+
+  // 先验 24 小时过期：同一份档案把实播时间改到 25 小时前 → 不再使用先验（档案本身 7 天内仍保留）。
+  const aged = JSON.parse(seed.bhw_health);
+  for (const record of Object.values(aged.hosts)) if (record.realAt) record.realAt -= 25 * 3600e3;
+  const stale = await openRound({ bhw_health: JSON.stringify(aged) });
+  const staleCosov = stale.result?.list.find(item => item.host === H('cosov'));
+  check('8 先验 24 小时后失效（换网/VPN 不长期粘住）', stale.result?.win === H('cosov') && staleCosov?.priorKbps == null,
+    `选=${stale.result?.win} 先验=${staleCosov?.priorKbps}`);
+
+  // 卡顿惩罚：每次卡顿折 4 片；08c 实播 900 但 8 片里卡 4 次 → 先验 300 < hw 先验 600（无卡顿）。
+  const now = 1_790_000_000_000;
+  const penal = { version: 2, updatedAt: now, hosts: {
+    [H('08c')]: { attempts: 6, successes: 6, kbps: 900, ttfb: 100, at: now, real: 900, realN: 8, stalls: 4, realAt: now },
+    [H('hw')]: { attempts: 6, successes: 6, kbps: 700, ttfb: 100, at: now, real: 600, realN: 8, stalls: 0, realAt: now },
+  } };
+  const p = createPage(CACHE_LIE_MODEL, { hud: false, seed: { bhw_health: JSON.stringify(penal) } });
+  const lines = p.api.主机健康;
+  check('8 卡顿按次折扣先验（900×8/(8+4×4)=300）', /先验 300KB\/s/.test(lines['08c'] || Object.values(lines).find(v => /卡顿 4/.test(v)) || '') &&
+    /先验 600KB\/s/.test(Object.values(lines).find(v => /卡顿 0/.test(v)) || ''), JSON.stringify(lines));
+
+  // 实播卡顿计入当时在用的源：所有源真实只有 150（低于码率 272），连续播放必卡。
+  const slow = createPage({ speed: () => 150 }, { hud: false });
+  slow.setPlayinfo();
+  slow.startPlayback({ host: H('cosov') });
+  await slow.clock.advance(120_000);
+  slow.stopPlayback();
+  const slowHealth = Object.values(readHealth(slow)?.hosts || {});
+  const stallTotal = slowHealth.reduce((sum, r) => sum + (r.stalls || 0), 0);
+  check('8 实播卡顿写进健康档案（≤片数，随落盘持久化）', slow.api.卡顿次数 > 0 && stallTotal > 0 &&
+    slowHealth.every(r => !r.stalls || r.stalls <= r.realN), `会话卡顿=${slow.api.卡顿次数} 档案卡顿合计=${stallTotal}`);
+
+  // 格式兼容：坏的实播字段整组丢弃、探测统计保留；无探测也无实播的空记录丢弃；40 个 host 裁到 32。
+  const messy = { version: 2, updatedAt: now, hosts: {
+    [H('08c')]: { attempts: 5, successes: 5, kbps: 900, at: now, real: 'abc', realN: -1, stalls: 9, realAt: now },
+    [H('zzz')]: { attempts: 0, successes: 0, kbps: 0, at: now },
+    [H('ali')]: { attempts: 0, successes: 0, kbps: 0, at: now, real: 300, realN: 5, stalls: 99, realAt: now },
+  } };
+  for (let i = 0; i < 40; i++) messy.hosts[`upos-sz-mirrorx${i}.bilivideo.com`] = { attempts: 3, successes: 3, kbps: 100, at: now - 1000 - i };
+  const m = createPage(CACHE_LIE_MODEL, { hud: false, seed: { bhw_health: JSON.stringify(messy) } });
+  m.setPlayinfo();
+  m.attachVideo();
+  m.video.paused = true;
+  m.requestSegment();                       // 一片真实分片 → 实播样本落盘（首个样本不受 30 秒节流）
+  await m.clock.advance(10_000);
+  const mh = JSON.parse(m.sandbox.localStorage.getItem('bhw_health') || '{}').hosts || {};
+  const legacy = legacySource();
+  let legacyOk = null;
+  if (legacy && !/realPrior/.test(legacy)) {
+    // 旧版脚本读到带实播字段的新档案：不报错、照常读取探测统计（只是忽略新字段）。
+    const old = await openRound(seed, legacy);
+    legacyOk = !!old.result?.win && Object.keys(old.page.api.主机健康).length > 0;
+  }
+  check('8 档案格式兼容与有界（坏字段丢弃、空记录丢弃、≤32 条、卡顿≤片数；旧版可读新档案）',
+    mh[H('08c')]?.attempts >= 5 && mh[H('08c')].real === undefined && !mh[H('zzz')] &&
+    mh[H('ali')]?.realN === 5 && mh[H('ali')].stalls === 5 && Object.keys(mh).length === 32 && legacyOk !== false,
+    `08c=${JSON.stringify(mh[H('08c')])} ali=${JSON.stringify(mh[H('ali')])} 条数=${Object.keys(mh).length} 旧版=${legacyOk ?? '跳过'}`);
+}
+
 async function contrast() {
   let legacy;
   try {
@@ -798,6 +926,7 @@ await scenarioCodec();
 await scenarioSegmentForbidden();
 await scenarioBanRecovery();
 await scenarioDiagnostics();
+await scenarioRealPrior();
 if (CONTRAST) await contrast();
 const failed = results.filter(item => !item.pass);
 console.log(`\n=== qa-stall：PASS=${results.length - failed.length} FAIL=${failed.length}，耗时 ${((Date.now() - started) / 1000).toFixed(1)}s ===`);
