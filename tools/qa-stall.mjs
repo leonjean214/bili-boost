@@ -1009,10 +1009,11 @@ async function scenarioQualityRestore() {
 // 场景 10：码率告警里的旧数据时效。开播测速时各源都 600KB/s，之后整体网速掉到 200（< 码率 272）。
 // 缓冲一直不足 15 秒 → 禁测，其他源的 600 旧探测值没人刷新。旧版靠它判“还有源够快”，永远不告警、不降档。
 const DEGRADE_AT = 60_000;
-async function degradeRun(source = SCRIPT, { autoDowngrade = false, onlyCurrent = false, slowKbps = 200, minutes = 8 } = {}) {
+async function degradeRun(source = SCRIPT, { autoDowngrade = false, onlyCurrent = false, slowKbps = 200, minutes = 8,
+  degradeAt = DEGRADE_AT, manual = false, otherKbps = 600 } = {}) {
   let t0 = null;
-  const slow = (host, now) => t0 != null && now - t0 >= DEGRADE_AT && (!onlyCurrent || host === H('cosov'));
-  const page = createPage({ speed: (host, offset, kind, now) => (slow(host, now) ? slowKbps : 600) }, { hud: true, source });
+  const slow = (host, now) => t0 != null && now - t0 >= degradeAt && (!onlyCurrent || host === H('cosov'));
+  const page = createPage({ speed: (host, offset, kind, now) => (slow(host, now) ? slowKbps : host === H('cosov') ? 600 : otherKbps) }, { hud: true, source });
   t0 = page.clock.now;
   setQualityPlayinfo(page);
   const calls = [];
@@ -1022,6 +1023,7 @@ async function degradeRun(source = SCRIPT, { autoDowngrade = false, onlyCurrent 
     calls.push({ qn, at: page.clock.now - t0 }); state.nowQ = qn; page.player.path = QUALITY_PATHS[qn]; } };
   if (autoDowngrade) page.api.自动降档(true);
   page.startPlayback({ host: H('cosov') });
+  if (manual) { await page.clock.advance(5_000); page.api.手动选源(H('cosov')); }
   let warnAt = null;
   let warnHud = '';
   let earlyWarn = false;
@@ -1029,7 +1031,7 @@ async function degradeRun(source = SCRIPT, { autoDowngrade = false, onlyCurrent 
   let minAhead = Infinity;
   for (let t = 0; t < minutes * 60_000; t += 5_000) {
     await page.clock.advance(5_000);
-    if (t >= DEGRADE_AT) minAhead = Math.min(minAhead, page.bufferAhead());
+    if (t >= degradeAt) minAhead = Math.min(minAhead, page.bufferAhead());
     const warn = page.api.码率.告警;
     if (!warn) continue;
     if (warnAt == null) { warnAt = page.clock.now - t0; warnHud = page.hudText(); }
@@ -1037,7 +1039,7 @@ async function degradeRun(source = SCRIPT, { autoDowngrade = false, onlyCurrent 
     const roundTs = page.api.测速结果?.ts;
     if (roundTs && page.clock.now - roundTs < 180_000 && warn.stale === 0 && warn.best >= 600 * 0.9) earlyWarn = true;
   }
-  const out = { page, calls, warnAt, probes: page.net.probes.length, minAhead, warnHud, earlyWarn, warn: page.api.码率.告警, source: page.api.当前源,
+  const out = { page, t0, stalls: page.api.卡顿次数, calls, warnAt, probes: page.net.probes.length, minAhead, warnHud, earlyWarn, warn: page.api.码率.告警, source: page.api.当前源,
     timersGrew: page.clock.timers.size > timersBefore };
   page.stopPlayback();
   return out;
@@ -1086,6 +1088,54 @@ async function scenarioStaleEvidence() {
     `告警=${warned}；补测 ${page.net.probes.length - probesAt} 次；真实速度=${JSON.stringify(real)}`);
   page.stopPlayback();
 }
+
+// 场景 11：当前源连续 3 片真实分片低于码率、还没卡：用已有的新鲜数据主动切到够快的源，不等卡顿。
+const short = host => String(host || '').replace(/^upos-sz-mirror|\.bilivideo\.com$/g, '');
+const slowSwitches = run => run.page.api.切源记录.filter(item => /跟不上码率/.test(item.why));
+function describeRun(run) {
+  return `切源=${run.page.api.切源记录.map(item => `${short(item.from)}→${short(item.to)}@${Math.round((item.at - run.t0) / 1000)}s(${item.why})`).join('，') || '无'}；` +
+    `卡顿 ${run.stalls} 次；降速后最低缓冲 ${run.minAhead.toFixed(1)}s；当前源=${short(run.source)}；探测 ${run.probes} 次`;
+}
+async function scenarioSlowSegments() {
+  // 码率 272，cosov 在 60 秒后掉到 150（< 码率），其他源仍 600（开播测速新鲜）。
+  const run = await degradeRun(SCRIPT, { onlyCurrent: true, slowKbps: 150, minutes: 4 });
+  const first = slowSwitches(run)[0];
+  check('11 当前源连续 3 片低于码率 → 不等卡顿，按新鲜测速主动切到够快的源',
+    first && first.from === H('cosov') && first.at - run.t0 <= DEGRADE_AT + 30_000 && run.source !== H('cosov') &&
+    run.stalls === 0 && run.minAhead >= 10 && !run.timersGrew, describeRun(run));
+  const legacy = legacySource();
+  if (legacy && legacy !== SCRIPT) {
+    const old = await degradeRun(legacy, { onlyCurrent: true, slowKbps: 150, minutes: 4 });
+    check('11 对照：旧版（origin/main）同场景要等缓冲见底、确认卡顿后才切',
+      old.stalls >= 1 && old.minAhead < 1, `旧版：卡顿 ${old.stalls} 次，降速后最低缓冲 ${old.minAhead.toFixed(1)}s；新版：卡顿 ${run.stalls} 次`);
+  }
+  // 整体网速掉到 240（略低于码率，缓冲慢慢掉、不卡）：开播测速还新鲜时可能照着它试切，
+  // 但刚连续跟不上的源不再选回（不 A↔B 横跳），测速过期后就停手；每次间隔 ≥60 秒。
+  const all = await degradeRun(SCRIPT, { slowKbps: 240, minutes: 8 });
+  const allSlow = slowSwitches(all);
+  const left = new Set();
+  let back = false;
+  let lastAt = -Infinity;
+  let gapOk = true;
+  for (const item of allSlow) {
+    back ||= left.has(item.to);
+    left.add(item.from);
+    gapOk &&= item.at - lastAt >= 60_000;
+    lastAt = item.at;
+  }
+  const lastSlowAt = allSlow.length ? allSlow.at(-1).at - all.t0 : 0;
+  check('11 所有源都跟不上时不在慢源之间来回切：不切回刚跟不上的源、间隔 ≥60 秒、测速过期后停手',
+    allSlow.length >= 1 && !back && gapOk && lastSlowAt <= 180_000 + 60_000 && !all.timersGrew, describeRun(all));
+  // 其他源测速只有 250（< 码率 272）：切过去也跟不上，不主动切（交给码率告警/降档）。
+  const weak = await degradeRun(SCRIPT, { onlyCurrent: true, slowKbps: 150, otherKbps: 250, minutes: 3 });
+  check('11 候选源也跟不上码率时不主动切源', slowSwitches(weak).length === 0, describeRun(weak));
+  // 用户手选的源不动（卡顿后的原有逻辑不变）。
+  const man = await degradeRun(SCRIPT, { onlyCurrent: true, slowKbps: 150, minutes: 4, manual: true });
+  check('11 手选源连续低于码率时不主动切源', slowSwitches(man).length === 0, describeRun(man));
+  // 开播测速已过期（4 分钟后才降速）：其他源只有旧数字，不凭它主动切；交给码率告警的补测。
+  const late = await degradeRun(SCRIPT, { onlyCurrent: true, slowKbps: 150, minutes: 8, degradeAt: 240_000 });
+  check('11 其他源只有过期（>3 分钟）测速时不凭旧数字主动切源', slowSwitches(late).length === 0, describeRun(late));
+}
 async function contrast() {
   let legacy;
   try {
@@ -1120,6 +1170,7 @@ await scenarioDiagnostics();
 await scenarioRealPrior();
 await scenarioQualityRestore();
 await scenarioStaleEvidence();
+await scenarioSlowSegments();
 if (CONTRAST) await contrast();
 const failed = results.filter(item => !item.pass);
 console.log(`\n=== qa-stall：PASS=${results.length - failed.length} FAIL=${failed.length}，耗时 ${((Date.now() - started) / 1000).toFixed(1)}s ===`);
