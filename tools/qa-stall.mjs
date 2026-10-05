@@ -284,6 +284,13 @@ function createPage(model, { hud = true, mediaCapabilities = 'safari', source = 
         : { supported: true, smooth: true, powerEfficient: !/av01/i.test(config.video.contentType) }),
     };
   }
+  // 只记脚本自己建的定时器（模拟网络/播放器的定时器直接走 clock，不算），用于判断脚本定时器是否随时间增长。
+  const scriptTimers = new Set();
+  const scriptTimer = id => { scriptTimers.add(id); return id; };
+  const liveScriptTimers = () => {
+    for (const id of scriptTimers) if (!clock.timers.has(id)) scriptTimers.delete(id);
+    return scriptTimers.size;
+  };
   class FakeDate extends Date { static now() { return clock.now; } }
   const windowListeners = new Emitter();
   const sandbox = {
@@ -299,9 +306,9 @@ function createPage(model, { hud = true, mediaCapabilities = 'safari', source = 
     navigator,
     performance: { now: () => clock.perf() },
     Date: FakeDate,
-    setTimeout: (fn, ms, ...args) => clock.setTimeout(fn, ms, ...args),
+    setTimeout: (fn, ms, ...args) => scriptTimer(clock.setTimeout(fn, ms, ...args)),
     clearTimeout: id => clock.clear(id),
-    setInterval: (fn, ms, ...args) => clock.setInterval(fn, ms, ...args),
+    setInterval: (fn, ms, ...args) => scriptTimer(clock.setInterval(fn, ms, ...args)),
     clearInterval: id => clock.clear(id),
     queueMicrotask,
     fetch,
@@ -389,7 +396,7 @@ function createPage(model, { hud = true, mediaCapabilities = 'safari', source = 
   const bufferAhead = () => (video ? video.bufferedEnd - video.currentTime : 0);
   const hudText = () => elements.get('bili-boost-hud')?.textContent || '';
 
-  return { clock, net, api, sandbox, logs, setPlayinfo, attachVideo, startPlayback, stopPlayback, requestSegment,
+  return { clock, net, api, sandbox, logs, liveScriptTimers, setPlayinfo, attachVideo, startPlayback, stopPlayback, requestSegment,
     player, bufferAhead, hudText, get hud() { return elements.get('bili-boost-hud') || null; }, get video() { return video; } };
 }
 
@@ -1221,6 +1228,102 @@ async function scenarioStartupQuick() {
   const man = await startupRun(SCRIPT, { caps: slowOrig, manual: H('cosov') });
   check('12 手选源时不暂定切换', man.quick.length === 0, man.text);
 }
+// 场景 13：叠层功能联合长测（只加测试，不改脚本）。#11 码率旧数据时效、#12 跟不上码率主动切源、#13 开播快筛、
+// 403 拉黑、自动降档/回升各自有单项场景，但从没在同一次播放里先后触发过。这里 30 分钟虚拟播放按阶段依次触发，
+// 看它们叠在一起时：状态/定时器/监听/落盘仍有界，测速并发 =1、缓冲不足不测，计入限频的自动切源间隔 ≥60 秒，播放不断。
+const COMBO_PHASES = [
+  { until: 5 * 60_000, name: '开播原始源慢' },     // cosov 120 → 开播快筛切到 08c
+  { until: 10 * 60_000, name: '08c 跌到码率以下' },  // 08c 150 → 跟不上码率 / 卡顿切走
+  { until: 12 * 60_000, name: 'hw 分片 403' },       // hw 真实分片 403 → 拉黑回退
+  { until: 20 * 60_000, name: '整体降速' },          // 全部 200 → 码率告警、自动降档
+  { until: 30 * 60_000, name: '网速恢复' },          // 全部 900 → 回升
+];
+async function comboRun(source = SCRIPT) {
+  let t0 = null;
+  const at = now => (t0 == null ? 0 : now - t0);
+  const phase = now => COMBO_PHASES.findIndex(item => at(now) < item.until);
+  const page = createPage({
+    speed(host, offset, kind, now) {
+      const p = phase(now);
+      if (p === 0) return host === H('cosov') ? 120 : host === H('08c') ? 900 : host === H('hw') ? 700 : 300;
+      if (p === 1 || p === 2) return host === H('08c') ? 150 : host === H('hw') ? 700 : host === H('cosov') ? 120 : 400;
+      if (p === 3) return 200;
+      return 900;
+    },
+    segmentStatus: (host, now) => (phase(now) === 2 && host === H('hw') ? 403 : 206),
+    ttfb: () => 120,
+  }, { hud: true, source });
+  t0 = page.clock.now;
+  setQualityPlayinfo(page);
+  const calls = [];
+  const state = { nowQ: 80 };
+  page.player.path = QUALITY_PATHS[80];
+  page.sandbox.player = { getQuality: () => ({ nowQ: state.nowQ }), requestQuality: qn => {
+    calls.push({ qn, at: at(page.clock.now) }); state.nowQ = qn; page.player.path = QUALITY_PATHS[qn]; } };
+  page.api.自动降档(true);
+  page.startPlayback({ host: H('cosov') });
+  let waits = 0;
+  page.video.addEventListener('waiting', () => { waits++; });
+  await page.clock.advance(30_000);
+  // 基线取开播 30 秒后（开播测速、HUD 定时器都已就位），之后只许回落不许涨。
+  const base = { timers: page.liveScriptTimers(), listeners: [...page.sandbox.document.listeners.values()].reduce((n, list) => n + list.length, 0) };
+  const switches = new Map();
+  const note = () => { for (const item of page.api.切源记录) switches.set(`${item.at}|${item.from}|${item.to}`, item); };
+  let peakTimers = 0;
+  let peakState = {};
+  let lowBufferProbes = 0;
+  let seenProbes = 0;
+  for (let t = 30_000; t < COMBO_PHASES.at(-1).until; t += 5_000) {
+    await page.clock.advance(5_000);
+    note();
+    peakTimers = Math.max(peakTimers, page.liveScriptTimers());
+    for (const [k, v] of Object.entries(page.api.诊断状态)) if (typeof v === 'number') peakState[k] = Math.max(peakState[k] ?? 0, v);
+    for (; seenProbes < page.net.probes.length; seenProbes++) {
+      const probe = page.net.probes[seenProbes];
+      if (probe.video && !probe.video.paused && probe.video.time > 0.5 && probe.video.ahead < 15) lowBufferProbes++;
+    }
+  }
+  const listeners = [...page.sandbox.document.listeners.values()].reduce((n, list) => n + list.length, 0);
+  const storageChars = [...page.sandbox.localStorage.map].reduce((n, [key, value]) => n + key.length + value.length, 0);
+  const log = [...switches.values()].sort((a, b) => a.at - b.at);
+  const limited = log.filter(item => item.why !== '开播快筛' && !/拉黑/.test(item.why));
+  const gaps = limited.slice(1).map((item, i) => item.at - limited[i].at);
+  const out = { page, t0, calls, log, limited, gaps, base, peakTimers, endTimers: page.liveScriptTimers(), listeners,
+    peakState, endState: page.api.诊断状态, lowBufferProbes, probePeak: page.net.probePeak, storageChars,
+    stalls: page.api.卡顿次数, waits, played: page.video.currentTime, aborts: page.net.xhrAborts,
+    text: `切源=${log.map(item => `${short(item.from)}→${short(item.to)}@${Math.round((item.at - t0) / 1000)}s(${item.why})`).join('，') || '无'}；` +
+      `清晰度=${[80, ...calls.map(call => call.qn)].join('→')}；卡顿 ${page.api.卡顿次数} 次；播放到 ${Math.round(page.video.currentTime)}s` };
+  page.stopPlayback();
+  return out;
+}
+async function scenarioCombined() {
+  const run = await comboRun();
+  const whys = run.log.map(item => item.why);
+  // 只要求各功能都被走到，不规定 08c 走哪条路被切走（现在是码率告警的补测先到，跟不上码率在整体降速时触发）。
+  check('13 联合长测：各阶段的功能都真的触发了（开播快筛、08c 变慢后被自动切走、跟不上码率、403 拉黑、降档、回升）',
+    whys.includes('开播快筛') && run.log.some(item => item.from === H('08c') && item.at - run.t0 < COMBO_PHASES[1].until) &&
+    whys.some(why => /跟不上码率/.test(why)) &&
+    whys.some(why => /HTTP 403/.test(why)) && run.calls.some(call => call.qn < 80) &&
+    run.calls.length >= 2 && run.calls.at(-1).qn > Math.min(...run.calls.map(call => call.qn)), run.text);
+  check('13 联合长测：计入限频的自动切源间隔都 ≥60 秒（开播快筛、403 拉黑除外），30 分钟内切源 ≤12 次',
+    run.gaps.every(gap => gap >= 60_000) && run.log.length <= 12,
+    `计入限频 ${run.limited.length} 次，间隔(s)=${run.gaps.map(gap => Math.round(gap / 1000)).join(',') || '—'}；全部 ${run.log.length} 次`);
+  check('13 联合长测：测速并发 =1，播放中缓冲 <15 秒不发探测',
+    run.probePeak <= 1 && run.lowBufferProbes === 0, `并发峰值=${run.probePeak}，缓冲不足时探测 ${run.lowBufferProbes} 次，探测共 ${run.page.net.probes.length} 次`);
+  const p = run.peakState;
+  check('13 联合长测：状态有界（perf≤6、切源记录≤8、黑名单≤64、健康档≤32、真实速度≤源数、localStorage≤16KB）',
+    p.perf <= 6 && p.switches <= 8 && p.blacklist <= 64 && p.health <= 32 && p.realHosts <= 12 &&
+    p.probeControllers <= 1 && p.probing <= 1 && p.pendingProbe <= 1 && p.warningTimers <= 1 && run.storageChars <= 16 * 1024,
+    `峰值=${JSON.stringify(p)}，localStorage ${run.storageChars} 字符`);
+  check('13 联合长测：脚本定时器与文档监听不随时间增长，结束时没有挂着的测速',
+    run.peakTimers <= run.base.timers + 2 && run.endTimers <= run.base.timers && run.listeners === run.base.listeners &&
+    run.endState.probing === 0 && run.endState.probeControllers === 0,
+    `脚本定时器 基线 ${run.base.timers} / 峰值 ${run.peakTimers} / 结束 ${run.endTimers}；监听 ${run.base.listeners} → ${run.listeners}；结束 probing=${run.endState.probing}`);
+  // 模拟播放器每片固定 512KB、不随清晰度变小，降档后整体降速阶段仍会反复短暂见底（waiting），属于测试桩的局限。
+  check('13 联合长测：播放不断（不 abort 播放器分片，30 分钟至少播放 25 分钟）',
+    run.aborts === 0 && run.played >= 25 * 60,
+    `abort=${run.aborts}，播放到 ${Math.round(run.played)}s，确认卡顿 ${run.stalls} 次，播放器 waiting ${run.waits} 次`);
+}
 async function contrast() {
   let legacy;
   try {
@@ -1257,6 +1360,7 @@ await scenarioQualityRestore();
 await scenarioStaleEvidence();
 await scenarioSlowSegments();
 await scenarioStartupQuick();
+await scenarioCombined();
 if (CONTRAST) await contrast();
 const failed = results.filter(item => !item.pass);
 console.log(`\n=== qa-stall：PASS=${results.length - failed.length} FAIL=${failed.length}${skipped.length ? ` SKIP=${skipped.length}` : ''}，耗时 ${((Date.now() - started) / 1000).toFixed(1)}s ===`);
