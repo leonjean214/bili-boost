@@ -839,6 +839,83 @@ const RESOURCE_PRESSURE_PRELUDE = String.raw`
   };
 `;
 
+// 真实 DOM 点击 + 模拟 CDN：不依赖公网源速度，覆盖低缓冲手动入口与串行排队。
+async function runManualProbeTests() {
+  for (const capability of [false, true]) {
+    const name = `HUD 手动测速（${capability ? '有' : '无'} AV1 硬解）`;
+    await runScenario(name, async cdp => {
+      await navigate(cdp, 'https://www.bilibili.com/robots.txt?qa_manual_probe');
+      const audit = await cdp.eval(String.raw`(async () => {
+        const api = window.__biliBoost;
+        const tick = ms => new Promise(resolve => setTimeout(resolve, ms));
+        const until = async test => {
+          for (let i = 0; i < 1000; i++) { if (test()) return; await tick(10); }
+          throw new Error('manual probe fixture timed out');
+        };
+        const video = document.createElement('video'); document.body.appendChild(video);
+        Object.defineProperties(video, {
+          paused: { get: () => false }, ended: { get: () => false }, currentTime: { get: () => 10 },
+          buffered: { get: () => ({ length: 1, start: () => 0, end: () => 11 }) }
+        });
+        await fetch('https://upos-sz-mirrorcosov.bilivideo.com/qa-manual/segment.m4s', {
+          headers: { Range: 'bytes=0-65535' }
+        });
+        await tick(100);
+        api.面板(true);
+        const automaticBlocked = window.__qaManual.probes === 0 && api.诊断状态.probeBlocked > 0;
+        const button = document.querySelector('[data-action="probe"]');
+        if (!button) return { automaticBlocked, hasButton: false };
+        const controls = !!document.querySelector('[data-action="copy-diag"]') &&
+          /测速会短暂占用带宽/.test(document.getElementById('bili-boost-hud').textContent);
+        button.click();
+        await until(() => window.__qaManual.probes > 0);
+        const progress = /测速中.*第 \d+\/\d+ 个源/.test(document.querySelector('[data-action="probe"]').textContent);
+        document.querySelector('[data-action="probe"]').click();
+        document.querySelector('[data-action="probe"]').click();
+        const queued = api.诊断状态.pendingProbe === 1 && api.诊断状态.probing === 1;
+        const timestamps = new Set();
+        await until(() => {
+          if (api.测速结果) timestamps.add(api.测速结果.ts);
+          return timestamps.size === 2 && api.诊断状态.probing === 0 && api.诊断状态.pendingProbe === 0;
+        });
+        const probes = window.__qaManual.probes;
+        await tick(600);
+        const hud = document.getElementById('bili-boost-hud');
+        const rows = [...hud.querySelectorAll('[data-result-host]')];
+        const selected = rows.filter(row => row.dataset.selected === 'true');
+        return { automaticBlocked, controls, progress, queued,
+          manualRan: probes > 0, serial: window.__qaManual.peak === 1,
+          exactlyTwo: timestamps.size === 2 && window.__qaManual.probes === probes,
+          resultsMatch: selected.length === 1 && selected[0].dataset.resultHost === api.当前源 &&
+            api.测速结果.list.every(result => rows.some(row => row.dataset.resultHost === result.host &&
+              row.textContent.includes(String(result.fusedKbps || result.effectiveKbps || result.kbps || 0)) &&
+              row.textContent.includes(String(result.ttfb)))) &&
+            /选择原因：/.test(hud.textContent) && /未拉黑/.test(hud.textContent),
+          clean: api.诊断状态.probeControllers === 0 };
+      })()`, true);
+      addResult(name, Object.values(audit).every(value => value === true) ? 'PASS' : 'FAIL', { reason: JSON.stringify(audit) });
+    }, { beforeObserver: RESET_CODEC_AUTO, prelude: codecProbePrelude(capability) + String.raw`
+      localStorage.setItem('bhw_hud', 'true');
+      window.__qaManual = { probes: 0, active: 0, peak: 0 };
+      const qaFetch = window.fetch;
+      window.fetch = async (input, init = {}) => {
+        const url = String(input?.url || input);
+        if (!url.includes('.bilivideo.com/qa-manual/')) return qaFetch(input, init);
+        const probe = init.cache === 'no-store';
+        const state = window.__qaManual;
+        if (probe) { state.probes++; state.active++; state.peak = Math.max(state.peak, state.active); }
+        await new Promise(resolve => setTimeout(resolve, 60));
+        if (probe) state.active--;
+        const range = /bytes=(\d+)-(\d+)/i.exec(init.headers?.Range || '');
+        const size = range ? Number(range[2]) - Number(range[1]) + 1 : 65536;
+        return new Response(new Uint8Array(size), { status: 206, headers: {
+          'Content-Length': String(size), 'Content-Range': 'bytes 0-' + (size - 1) + '/67108864'
+        } });
+      };
+    ` });
+  }
+}
+
 async function runResourceTests() {
   await runScenario('资源计数器自测', async cdp => {
     await navigate(cdp, 'https://www.bilibili.com/robots.txt?qa_resource_counter');
@@ -1042,6 +1119,8 @@ async function main() {
   }
   browserCdp = await CDP.connect(version.webSocketDebuggerUrl);
 
+  await runManualProbeTests();
+  if (process.argv.includes('--manual-probe-only')) return;
   console.log('动态发现 B站测试目标…');
   const targets = await discover();
   console.log(`UGC: ${targets.ugc.map(item => item.bvid).join(', ')}`);

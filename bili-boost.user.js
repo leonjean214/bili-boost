@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         哔哩哔哩播放优化（CDN 测速切源 + 强制硬解编码）
 // @namespace    https://github.com/leonjean214/bili-boost
-// @version      1.7.0
+// @version      1.8.0
 // @description  CDN 测速切源（播放前方测速点 + 真实分片融合 + 滞回防横跳 + 缓冲不足禁测），并剔除 AV1、优先 HEVC/H.264，降低海外播放卡顿与软解发热。
 // @author       leonjean214
 // @match        *://*.bilibili.com/*
@@ -63,7 +63,7 @@
   const HEALTH_PRIOR_WEIGHT = 0.35;  // 先验权重低于本会话真实分片（0.6/0.8），高于“没有”
   const HEALTH_STALL_WEIGHT = 4;     // 每次卡顿折算为 4 片的惩罚：每 4 片 1 次卡顿 → 先验减半
   const HEALTH_REAL_SAVE_INTERVAL = 30e3; // 实播样本最多 30 秒落盘一次；不加定时器，随分片顺带检查
-  // v1.7.0：前向缓冲低于 15 秒时禁止一切探测（快筛、精测、重测），只用已有数据决策。
+  // 前向缓冲低于 15 秒时禁止自动探测，只用已有数据决策；用户手动测速例外。
   // 开播前（还没开始前进）和暂停时不受限：那时没有正在播放的分片可抢带宽。
   const PROBE_BUFFER_MIN = 15;
   const IDLE_MAX_WAIT = 20000;       // 精测最多等 20 秒缓冲恢复；等不到就放弃精测，不再“到点照跑”
@@ -74,6 +74,8 @@
   const FALLBACK_AHEAD_OFFSET = 4 * 1024 * 1024;  // 还不知道播放器读到哪时的前方测速点
   const FALLBACK_REQUIRED_KBPS = 400; // playurl 未给码率时的保守需求（约 1080P）
   const BITRATE_HEADROOM = 1.2;
+  // 码率告警只认新鲜数据：其他源超过 3 分钟没有新的测速/真实分片，就不再凭旧数字撑住“还有源够快”。
+  const BITRATE_EVIDENCE_TTL = 180e3;
   const REAL_SAMPLES_MAX = 8;
   const REAL_WEIGHT_FEW = 0.6;       // 有 1~2 片真实数据时真实速度权重
   const REAL_WEIGHT_MANY = 0.8;      // 有 ≥N 片时
@@ -342,7 +344,7 @@
   // 但 B站有同源 iframe（如登录轮询用的 /correspond/），脚本在里面照样会跑，
   // 那里既不是视频页也拦不到分片。HUD 必须只由顶层窗口绘制，
   // 否则 iframe 会画出第二个 HUD，内容是「没拦到分片请求 / 未检测编码」。
-  const SCRIPT_VERSION = 'v1.7.0';   // ⚠️ 改版本时要和文件头的 @version 一起改
+  const SCRIPT_VERSION = 'v1.8.0';   // ⚠️ 改版本时要和文件头的 @version 一起改
 
   const IS_TOP = (() => { try { return window.top === window.self; } catch (e) { return false; } })();
 
@@ -389,6 +391,7 @@
     probeEpoch: 0,
     probeStartedAt: 0,
     pendingProbe: null,
+    probeProgress: null,
     autoProbed: new Set(),
     lastRoundAt: 0,
     probeBlocked: 0,
@@ -635,6 +638,7 @@
     cdnState.probeEpoch++;
     cdnState.probeStartedAt = 0;
     cdnState.pendingProbe = null;
+    cdnState.probeProgress = null;
     cdnState.autoProbed.clear();
     cdnState.lastRoundAt = 0;
     cdnState.lastStallAt = 0;
@@ -774,6 +778,7 @@
       while (cdnState.real.size > 16) cdnState.real.delete(cdnState.real.keys().next().value);
     }
     record.samples.push(effectiveKbps);
+    record.at = Date.now();
     if (record.samples.length > REAL_SAMPLES_MAX) record.samples.shift();
     record.below = effectiveKbps < needKbps() ? record.below + 1 : 0;
   }
@@ -825,16 +830,16 @@
     return null;
   }
   // 滞回 + 限频：返回 null 表示允许自动切换，否则返回保持原源的原因。手动切源不经过这里。
-  function switchBlockedReason(from, to, { stall = false, fromFailed = false } = {}) {
+  function switchBlockedReason(from, to, { stall = false, fromFailed = false, manual = false } = {}) {
     if (!from || !to || from === to) return null;
     const since = Date.now() - cdnState.lastSwitchAt;
-    if (cdnState.lastSwitchAt && since < SWITCH_MIN_INTERVAL) {
+    if (!manual && cdnState.lastSwitchAt && since < SWITCH_MIN_INTERVAL) {
       return `60 秒内已自动切过源（${Math.round(since / 1000)} 秒前），保持 ${shortName(from)}`;
     }
     if (fromFailed) return null;
     const fromReal = realSamples(from);
     // 第一次自动选源且旧源真实样本不足 N 片：没有可滞回的依据，按测速结论选。
-    if (!cdnState.lastSwitchAt && fromReal.length < HYSTERESIS_SEGMENTS) return null;
+    if ((!cdnState.lastSwitchAt || manual) && fromReal.length < HYSTERESIS_SEGMENTS) return null;
     if (stall && !fromReal.length) return null;
     const below = realRecord(from)?.below || 0;
     if (below >= HYSTERESIS_SEGMENTS || (stall && below >= 1)) return null;
@@ -846,31 +851,77 @@
     return `滞回：${shortName(from)} 未连续 ${HYSTERESIS_SEGMENTS} 片低于码率，${shortName(to)} 也未在真实分片上持续更快`;
   }
   // 只改后续请求的目标 host；正在传输的分片保持原连接，绝不 abort 播放器请求。
-  function commitAutoSwitch(key, from, to, why) {
+  // limit=false：不计入 60 秒限频（仅开播快筛的暂定切换用，每个媒体目录最多一次）。
+  function commitAutoSwitch(key, from, to, why, { limit = true } = {}) {
     cdnState.picked.set(key, to);
     saveCdnCache(key, to);
     cdnState.held = null;
     if (!from || from === to) return;
-    cdnState.lastSwitchAt = Date.now();
-    cdnState.switchLog.push({ at: cdnState.lastSwitchAt, from, to, why });
+    if (limit) cdnState.lastSwitchAt = Date.now();
+    cdnState.switchLog.push({ at: Date.now(), from, to, why });
     if (cdnState.switchLog.length > 8) cdnState.switchLog.shift();
   }
+  // 只认 3 分钟内的证据：该源自己的真实分片，或本轮测速（整轮未过期）。健康档案/过期探测不算。
+  function freshScore(host, now = Date.now()) {
+    const realFresh = realSamples(host).length > 0 && now - (realRecord(host).at || 0) <= BITRATE_EVIDENCE_TTL;
+    const probesFresh = !!cdnState.lastResults && now - cdnState.lastResults.ts <= BITRATE_EVIDENCE_TTL;
+    const probe = probesFresh ? cdnState.lastResults.list.find(item => item.host === host) : null;
+    if (!realFresh && !probeEffective(probe)) return null;
+    const kbps = fusedKbps(host, probe);
+    return kbps == null ? null : { kbps, via: realFresh ? '真实分片' : '测速' };
+  }
+  // 自己最近连续 N 片跟不上码率、且之后没有新一轮测速证明它恢复了：主动切源时不选它（防 A↔B 横跳）。
+  function recentlySlow(host) {
+    const record = realRecord(host);
+    return !!record && record.below >= HYSTERESIS_SEGMENTS &&
+      !(cdnState.lastResults && cdnState.lastResults.ts > (record.at || 0));
+  }
   // 缓冲不足时只用已有数据（真实分片、上轮测速、健康档案）挑一个替代源，不发任何探测。
-  function decideFromData(key, current, { stall = false } = {}) {
+  // fresh：主动切源（还没卡）只认新鲜证据，候选须跟得上码率，当前源按最近 N 片真实分片算。
+  function decideFromData(key, current, { stall = false, fresh = false } = {}) {
     const bad = cdnState.rejected.get(key);
     const pool = compatibleHostPool().filter(host => host !== current &&
-      !isBanned(host) && !(bad && bad.has(host)));
+      !isBanned(host) && !(bad && bad.has(host)) && !(fresh && recentlySlow(host)));
     if (!pool.length) return null;
-    const scored = pool.map(host => ({ host, score: knownScore(host) })).filter(item => item.score)
+    const score = fresh ? freshScore : knownScore;
+    const scored = pool.map(host => ({ host, score: score(host) })).filter(item => item.score)
       .sort((a, b) => b.score.kbps - a.score.kbps || a.host.localeCompare(b.host));
-    const currentScore = knownScore(current);
+    const recent = realSamples(current).slice(-HYSTERESIS_SEGMENTS);
+    const currentScore = fresh && recent.length ? { kbps: median(recent) } : knownScore(current);
     if (scored.length) {
       const best = scored[0];
       if (!stall && currentScore && best.score.kbps < currentScore.kbps * MIN_GAIN) return null;
+      if (fresh && best.score.kbps < needKbps()) return null;
       return { host: best.host, via: best.score.via, kbps: best.score.kbps };
     }
     // 毫无数据：只有确认卡顿才按候选顺序盲切（历史结论：08c 常最快，排第一）。
     return stall ? { host: pool[0], via: '候选顺序', kbps: null } : null;
+  }
+
+  // 开播首轮快筛一跑完就先按快筛结论改写后续分片，不等精测。精测要等缓冲 ≥15 秒（最多 20 秒），
+  // 原始源慢时缓冲涨不上去，以前只能在慢源上眼看缓冲耗尽、卡一次才切，而快筛早已知道哪个源快。
+  // 门槛与精测一致（同健康档、快 25%），另要求候选 ≥1.2×码率；精测照跑，结论按常规规则修正。
+  // 暂定切换不计入 60 秒限频，免得挡住精测修正或“跟不上码率”的主动切源（头部缓存骗过快筛时靠它们纠正）。
+  function applyStartupQuick(key, origHost, quick) {
+    if (cdnState.manual.get(key) || cdnState.curKey !== key) return;
+    const bad = cdnState.rejected.get(key);
+    const eligible = quick.filter(result => probeSucceeded(result) &&
+      !isBanned(result.host) && !(bad && bad.has(result.host))).sort(compareHosts);
+    const best = eligible[0];
+    if (!best) return;
+    const active = cdnState.activeHost && canRewriteHost(origHost, cdnState.activeHost) ? cdnState.activeHost : null;
+    const inUse = active || cdnState.picked.get(key) || origHost;
+    if (best.host === inUse) return;
+    const incumbent = eligible.find(result => result.host === inUse);
+    if (incumbent && healthTier(incumbent.host) === healthTier(best.host) &&
+        deliveryMs(best) >= deliveryMs(incumbent) / MIN_GAIN) return;
+    const kbps = best.fusedKbps ?? best.effectiveKbps ?? best.kbps;
+    if (!(kbps >= needKbps() * BITRATE_HEADROOM)) return;
+    if (switchBlockedReason(inUse, best.host, { fromFailed: !incumbent })) return;
+    commitAutoSwitch(key, inUse, best.host, '开播快筛', { limit: false });
+    cdnState.perf.length = 0;
+    console.log('[bili-cdn] 开播快筛先切到', best.host, `（${kbps}KB/s），精测稍后确认`);
+    renderHud(false);
   }
 
   // ---- 测速门控：全局并发 1、缓冲不足禁测、超时必清理 ----
@@ -887,8 +938,9 @@
     return bufferAhead(video) < PROBE_BUFFER_MIN;
   }
   function deferProbe(url, why, manual = false) {
-    if (!url) return;
+    if (!url || (!manual && cdnState.pendingProbe?.manual)) return;
     cdnState.pendingProbe = { url: new URL(url.toString()), why, manual, generation: mediaGeneration };
+    renderHud(false);
   }
   function maybeRunDeferredProbe() {
     const pending = cdnState.pendingProbe;
@@ -913,7 +965,9 @@
     cdnState.activeProbeControllers.clear();
     cdnState.probing.clear();
     cdnState.probeStartedAt = 0;
+    cdnState.probeProgress = null;
     probeTail = Promise.resolve();
+    renderHud(false);
   }
   function parseRange(value) {
     const match = /^bytes=(\d+)-(\d*)$/i.exec(String(value || '').trim());
@@ -1092,6 +1146,14 @@
       deferProbe(url, why === '开播' ? '缓冲恢复后补测' : why);
       return;
     }
+    // 排队请求只在真正开始时清理，不能破坏仍在运行的上一轮。
+    if (manual) cdnState.pendingProbe = null; // 本轮手动重测已覆盖等待缓冲的自动补测
+    if (manual && why === '手动') {
+      cdnState.manual.delete(key);
+      cdnState.picked.delete(key);
+      clearCdnCache(key);
+      cdnState.perf.length = 0;
+    }
     const probeKey = generation + ':' + key;
     const epoch = ++cdnState.probeEpoch;
     cdnState.probing.add(probeKey);
@@ -1108,8 +1170,12 @@
       const origHost = url.hostname;
       const bad = cdnState.rejected.get(key) || new Set();
       const pool = compatibleHostPool(origHost).filter(host =>
-        !isBanned(host) && !bad.has(host)
+        manual || (!isBanned(host) && !bad.has(host))
       );
+      const progress = (host, phase) => {
+        cdnState.probeProgress = { index: pool.indexOf(host) + 1, total: pool.length, phase };
+        renderHud(false);
+      };
       if (!pool.length) return;
       const ahead = aheadPoint(url);
 
@@ -1118,6 +1184,7 @@
       for (const host of pool) {
         if (!alive()) return;
         if (blocked()) { incomplete = true; break; }
+        progress(host, '快筛');
         let result = ahead?.label === '前方'
           ? await probeCdn(url, host, QUICK_BYTES, { offset: ahead.offset, point: '前方', epoch }) : null;
         if (!result || result.skipped) result = await probeCdn(url, host, QUICK_BYTES, { epoch });
@@ -1129,6 +1196,7 @@
       quick.sort(compareHosts);
 
       const finalists = quick.filter(probeSucceeded).slice(0, FINALISTS);
+      if (why === '开播' && !manual && !incomplete && alive()) applyStartupQuick(key, origHost, quick);
       const full = [];
       if (finalists.length && !incomplete) {
         const stallsBeforeWait = cdnState.stalls;
@@ -1138,8 +1206,9 @@
         if (!idle) incomplete = true;
         else for (const finalist of finalists) {
           const latestBad = cdnState.rejected.get(key);
-          if (isBanned(finalist.host) || (latestBad && latestBad.has(finalist.host))) continue;
+          if (!manual && (isBanned(finalist.host) || (latestBad && latestBad.has(finalist.host)))) continue;
           if (blocked()) { incomplete = true; break; }
+          progress(finalist.host, '精测');
           const result = await probePrecision(url, finalist.host, aheadPoint(url), epoch, blocked);
           if (!alive()) return;
           if (result.aborted) { incomplete = true; break; }
@@ -1156,7 +1225,13 @@
       const eligible = (incomplete ? merged : full).filter(result => probeSucceeded(result) &&
         !isBanned(result.host) && !(latestBad && latestBad.has(result.host))).sort(compareHosts);
       const best = eligible[0];
-      if (!best || !alive()) return;
+      if (!alive()) return;
+      if (!best) {
+        cdnState.lastResults = { list: merged, win: currentCdnSource(), origHost, why, ts: Date.now(), incomplete,
+          reason: '没有可用且未被拉黑/拒绝的候选，保持当前源' };
+        renderHud(true);
+        return;
+      }
       const manualHost = cdnState.manual.get(key);
       const active = cdnState.activeHost && canRewriteHost(origHost, cdnState.activeHost) ? cdnState.activeHost : null;
       const inUse = (cdnState.curKey === key && (active || cdnState.picked.get(key))) || origHost;
@@ -1166,12 +1241,12 @@
         deliveryMs(best) >= deliveryMs(incumbent) / MIN_GAIN;
       let win = keep ? inUse : best.host;
       let held = null;
-      if (win !== inUse && !manual && !manualHost) {
+      if (win !== inUse && !manualHost) {
         // 在用源本轮探测失败/已被拉黑才算“坏源”；只是还没测到（缓冲不足提前收工）不算。
         const inUseResult = merged.find(result => result.host === inUse);
         const fromFailed = isBanned(inUse) || !!(latestBad && latestBad.has(inUse)) ||
           (!!inUseResult && !probeSucceeded(inUseResult));
-        held = switchBlockedReason(inUse, win, { fromFailed });
+        held = switchBlockedReason(inUse, win, { fromFailed, manual });
         if (held) win = inUse;
       }
 
@@ -1179,6 +1254,7 @@
       if (!manualHost) {
         if (win !== inUse) {
           commitAutoSwitch(key, inUse, win, '测速(' + why + ')');
+          if (manual && cdnState.curKey === key) cdnState.activeHost = null;
           cdnState.perf.length = 0;
         } else cdnState.picked.set(key, win);
       }
@@ -1192,7 +1268,8 @@
         cdnState.lastWinner = null;
         try { localStorage.removeItem('biliCdnWinner'); } catch (e) { }
       }
-      cdnState.lastResults = { list: merged, win, origHost, why, ts: Date.now(), incomplete, held };
+      const reason = manualHost ? '保留用户手选源' : held || (keep ? '在用源保护：候选提升不足 25%' : '健康档与融合速度/TTFB 评分最优');
+      cdnState.lastResults = { list: merged, win, origHost, why, ts: Date.now(), incomplete, held, reason };
       console.log('[bili-cdn] 测速(' + why + (incomplete ? '，缓冲不足未完成精测' : '') + ')',
         merged.map(result => `${shortName(result.host)}=${result.effectiveKbps ?? result.kbps}KB/s` +
           (result.fusedKbps ? `→融合${result.fusedKbps}` : '') + ` TTFB=${result.ttfb ?? '—'}ms` +
@@ -1203,7 +1280,11 @@
       // 一轮快筛 + 精测只落盘一次，避免每个候选都同步写 localStorage。
       saveHealth();
       cdnState.probing.delete(probeKey);
-      if (epoch === cdnState.probeEpoch) cdnState.probeStartedAt = 0;
+      if (epoch === cdnState.probeEpoch) {
+        cdnState.probeStartedAt = 0;
+        cdnState.probeProgress = null;
+        renderHud(false);
+      }
       if (incomplete && generation === mediaGeneration && !cdnState.pendingProbe) deferProbe(url, '缓冲恢复后补测');
       if (cdnState.pendingProbe?.manual) Promise.resolve().then(maybeRunDeferredProbe);
     }
@@ -1513,6 +1594,8 @@
     if (cdnState.perf.length > PERF_WINDOW) cdnState.perf.shift();
     noteRealSample(request.host, metrics.effectiveKbps);
     recordRealHealth(request.host, metrics.effectiveKbps);
+    // 先试主动切源，再判断码率告警：切走后新源真实分片不足 N 片，不会立刻告警/降档。
+    switchOnSlowSegments(request);
     if (!checkBitrateHeadroom()) noteRestoreSample(request.host, metrics.effectiveKbps);
     renderHud(false);
   }
@@ -1524,18 +1607,37 @@
     const current = currentCdnSource();
     let best = 0;
     let measured = 0;
+    let stale = 0;
+    let staleBest = 0;
     if (required && realSamples(current).length >= HYSTERESIS_SEGMENTS) {
+      const now = Date.now();
+      // 测速结果整轮过期后不再参与（缓冲不足禁测时，旧探测值可能一直挂着）；当前源始终按自己的真实分片算。
+      const probesFresh = !!cdnState.lastResults && now - cdnState.lastResults.ts <= BITRATE_EVIDENCE_TTL;
       const hosts = new Set([...compatibleHostPool(), ...cdnState.real.keys()]);
       for (const host of hosts) {
         if (isBanned(host)) continue;
-        const value = fusedKbps(host, cdnState.lastResults?.list.find(item => item.host === host));
+        const probe = cdnState.lastResults?.list.find(item => item.host === host);
+        const realFresh = realSamples(host).length > 0 && now - (realRecord(host).at || 0) <= BITRATE_EVIDENCE_TTL;
+        if (host !== current && !realFresh && !probesFresh) {
+          const old = fusedKbps(host, probe);
+          if (old != null) { stale++; staleBest = Math.max(staleBest, old); }
+          continue;
+        }
+        const value = fusedKbps(host, probesFresh ? probe : null);
         if (value == null) continue;
         measured++;
         best = Math.max(best, value);
       }
     }
-    const warn = measured > 0 && best < required * BITRATE_HEADROOM;
-    bitrateState.warn = warn ? { required, best, hosts: measured, at: Date.now() } : null;
+    let warn = measured > 0 && best < required * BITRATE_HEADROOM;
+    if (warn && staleBest >= required * BITRATE_HEADROOM) {
+      // 只有过期数据说“还有源够快”：先补测一轮（照常受冷却和缓冲门控），补测会刷新数据并按滞回决定是否切源。
+      // 补测在跑、或缓冲还够补测时先等新数据；缓冲已不足 15 秒（禁测）就不再信旧数字，照常告警。
+      if (!cdnState.pendingProbe && !cdnState.probing.size) deferProbe(probeUrlFor(), '旧测速过期，补测');
+      if (cdnState.pendingProbe) maybeRunDeferredProbe();
+      if (cdnState.probing.size || !probeBlockedByBuffer()) warn = false;
+    }
+    bitrateState.warn = warn ? { required, best, hosts: measured, stale, at: Date.now() } : null;
     if (warn && autoDowngrade) maybeDowngrade();
     return warn;
   }
@@ -2103,6 +2205,28 @@
     renderHud(false);
   }
 
+  // 当前源连续 N 片真实分片低于码率（前向缓冲在掉、还没卡）：不等卡顿确认，用已有的新鲜数据切到够快的源。
+  // 不发探测、不加定时器；受 60 秒限频；用户手选的源不动；没有够快的新鲜候选就什么都不做（交给码率告警/补测）。
+  function switchOnSlowSegments(request) {
+    const key = request.key;
+    const current = currentCdnSource(key);
+    if (!current || request.host !== current || cdnState.manual.get(key)) return false;
+    if ((realRecord(current)?.below || 0) < HYSTERESIS_SEGMENTS) return false;
+    const decision = decideFromData(key, current, { fresh: true });
+    if (!decision) return false;
+    const held = switchBlockedReason(current, decision.host);
+    if (held) {
+      cdnState.held = { at: Date.now(), want: decision.host, keep: current, reason: held };
+      return false;
+    }
+    commitAutoSwitch(key, current, decision.host, '跟不上码率·' + decision.via);
+    if (cdnState.activeHost === current) cdnState.activeHost = null;
+    cdnState.perf.length = 0;
+    console.warn('[bili-cdn] 当前源连续', HYSTERESIS_SEGMENTS, '片低于码率 →', current, '改用', decision.host,
+      `（依据：${decision.via} ${decision.kbps}KB/s，需要 ${needKbps()}KB/s）`);
+    return true;
+  }
+
   function onPotentialStall(event) {
     const video = event.target;
     if (!(video instanceof HTMLVideoElement)) return;
@@ -2258,6 +2382,13 @@
         setHudEnabled(false);
         return;
       }
+      if (action === 'probe') {
+        event.stopPropagation();
+        const message = debugApi.重测();
+        diagNote = message === '还没拦到分片' ? message : '';
+        renderHud(true);
+        return;
+      }
       if (action === 'copy-diag') {
         event.stopPropagation();
         copyDiagnostics();
@@ -2302,7 +2433,8 @@
       (cdnState.stalls ? ` · <span style="color:#f66">卡顿 ${cdnState.stalls}</span>` : ' · 卡顿 0');
     const warn = bitrateState.warn;
     const bitrateLine = warn
-      ? `<span style="color:#f96">⚠️ 所有源都 &lt; 1.2×码率：需 ${warn.required} KB/s，最快约 ${warn.best} KB/s${autoDowngrade ? '' : '，建议降一档清晰度'}</span>`
+      ? `<span style="color:#f96">⚠️ 所有源都 &lt; 1.2×码率：需 ${warn.required} KB/s，最快约 ${warn.best} KB/s` +
+        `${warn.stale ? `（另有 ${warn.stale} 个源超过 3 分钟没有新数据，未计入）` : ''}${autoDowngrade ? '' : '，建议降一档清晰度'}</span>`
       : '';
     const [status, statusColor] = efficiencyText();
     const reason = codecReasonText();
@@ -2314,8 +2446,15 @@
       : '';
     const conflictPrefix = conflictLine ? conflictLine + '<br>' : '';
 
+    const progress = cdnState.probeProgress;
+    const probeLabel = progress ? `测速中 · ${progress.phase} 第 ${progress.index}/${progress.total} 个源` : '立即测速';
+    const buttonStyle = 'min-height:32px;padding:6px 10px;margin:4px 6px 4px 0;cursor:pointer;color:#8cf;background:#25252a;border:1px solid #555;border-radius:4px;font:inherit;-webkit-user-select:none;user-select:none';
+    const controls = `<br><button type="button" data-action="probe" style="${buttonStyle}">${probeLabel}${cdnState.pendingProbe?.manual ? '（已排队）' : ''}</button>` +
+      `<button type="button" data-action="copy-diag" style="${buttonStyle}">复制诊断 JSON</button>` +
+      '<br><span style="color:#ec9">测速会短暂占用带宽</span>' +
+      (diagNote ? `<br><span style="color:#888">${diagNote}</span>` : '');
     if (!hudExpanded) {
-      box.innerHTML = conflictPrefix + cdnLine + '<br>' + (bitrateLine ? bitrateLine + '<br>' : '') + codecLine;
+      box.innerHTML = conflictPrefix + cdnLine + '<br>' + (bitrateLine ? bitrateLine + '<br>' : '') + codecLine + controls;
       return;
     }
 
@@ -2326,13 +2465,15 @@
       probeRows = cdnState.lastResults.list.map(result => {
         shownHosts.add(result.host);
         const selectedManually = result.host === manual;
-        const mark = selectedManually ? '🖐' : result.host === cdnState.lastResults.win ? '✅'
+        const mark = selectedManually ? '🖐' : result.host === current ? '✅'
           : (result.host === cdnState.lastResults.origHost ? '原' : '　');
         const shown = result.fusedKbps || result.effectiveKbps || result.kbps || 0;
         const color = !probeSucceeded(result) ? '#f66' : shown >= goodKbps ? '#6c6' : '#ec9';
         const tag = (result.realSamples ? `融合${result.realSamples}片实测 · ` : '') + (result.note || result.stage);
-        const ttfb = Number.isFinite(result.ttfb) ? ` · ${String(result.ttfb).padStart(4)}ms` : '';
-        let row = `${mark} ${sourceLink(result.host)} <span style="color:${color}">${String(shown).padStart(5)}</span> KB/s${ttfb} <span style="color:#888">${tag}</span>`;
+        const ttfb = Number.isFinite(result.ttfb) ? ` · ${String(result.ttfb).padStart(4)}ms` : ' · TTFB —';
+        const banned = isBanned(result.host);
+        const banText = banned ? '已拉黑' : cdnState.rejected.get(cdnState.curKey)?.has(result.host) ? '本视频拒绝' : '未拉黑';
+        let row = `<span data-result-host="${result.host}" data-selected="${result.host === current}">${mark} ${sourceLink(result.host)} <span style="color:${color}">${String(shown).padStart(5)}</span> KB/s${ttfb} <span style="color:#888">${tag} · ${banText}</span></span>`;
         if (result.points?.length > 1) {
           row += '<br><span style="color:#777">　↳ ' + result.points.map(point =>
             `${point.point} ${point.kbps || 0}KB/s/${Number.isFinite(point.ttfb) ? point.ttfb + 'ms' : '—'}${point.note ? '(' + point.note + ')' : ''}`
@@ -2340,8 +2481,9 @@
         }
         return row;
       }).join('<br>');
-      if (cdnState.lastResults.win === cdnState.lastResults.origHost) {
-        probeRows += '<br><span style="color:#888">原始源够快，未改写</span>';
+      probeRows += `<br><span style="color:#8cf">选择原因：${manual ? '用户手选源' : current !== cdnState.lastResults.win ? '实播反馈/后续切源，以当前源为准' : cdnState.lastResults.reason || '融合评分与滞回'}</span>`;
+      if (current === cdnState.lastResults.origHost) {
+        probeRows += '<br><span style="color:#888">保持原始源，未改写</span>';
       }
       if (cdnState.lastResults.incomplete) {
         probeRows += '<br><span style="color:#888">缓冲不足，未完成精测：按快筛+真实分片决策，缓冲恢复后补测</span>';
@@ -2350,7 +2492,7 @@
     const unlisted = compatibleHostPool().filter(host => !shownHosts.has(host));
     if (unlisted.length) {
       probeRows += '<br>' + unlisted.map(host =>
-        `${host === manual ? '🖐' : '　'} ${sourceLink(host)} <span style="color:#777">未进入本轮测速，可强制尝试</span>`
+        `${host === manual ? '🖐' : host === current ? '✅' : '　'} ${sourceLink(host)} <span style="color:#777">未进入本轮测速 · ${isBanned(host) ? '已拉黑' : '未拉黑'}，可强制尝试</span>`
       ).join('<br>');
     }
     if (cdnState.lastResults || unlisted.length) {
@@ -2378,8 +2520,7 @@
       `<span data-action="codec" style="color:#8cf">编码模块：${codecModeLabel()}（点击轮换）</span><br>` +
       (codecActive() ? `<span data-action="prefer" style="color:#8cf">编码偏好：${prefer === 'avc' ? 'H.264' : 'H.265'}（点击切换）</span><br>` : '') +
       `<span data-action="hud" style="color:#8cf">HUD：开（点击关闭）</span>` +
-      `<br><span data-action="copy-diag" style="color:#8cf">复制诊断 JSON（反馈问题时附上）</span>` +
-      (diagNote ? `<span style="color:#888"> · ${diagNote}</span>` : '') +
+      controls +
       `<hr style="border:0;border-top:1px solid #444;margin:5px 0">${cdnLine}`;
     if (expand) {
       clearTimeout(box.__collapseTimer);
@@ -2588,12 +2729,9 @@
     },
     重测() {
       if (cdnState.lastProbeUrl) {
-        cdnState.manual.delete(cdnState.curKey);
-        cdnState.picked.delete(cdnState.curKey);
-        clearCdnCache(cdnState.curKey);
-        cdnState.perf.length = 0;
+        const queued = cdnState.probing.size > 0;
         runCdnProbe(probeUrlFor(), '手动', { manual: true });
-        return '测速中…';
+        return queued ? '已排队：本轮结束后立即测速' : '测速中…';
       }
       return '还没拦到分片';
     },
