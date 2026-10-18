@@ -5,6 +5,7 @@
 //   node tools/qa-stall.mjs            # 跑全部
 //   node tools/qa-stall.mjs --verbose  # 同时打印脚本日志
 //   node tools/qa-stall.mjs --contrast # 额外用 main 分支旧版跑同场景做对照（需要 git）
+//   QA_LEGACY_REF=<ref> node tools/qa-stall.mjs  # 场景内「旧版对照」改用指定 ref（默认 origin/main）；旧版已含该改动或跑不起来时记 SKIP
 import { execFileSync } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
 import vm from 'node:vm';
@@ -28,6 +29,11 @@ const results = [];
 const check = (name, pass, detail = '') => {
   results.push({ name, pass: !!pass, detail });
   console.log(`${pass ? 'PASS' : 'FAIL'}  ${name}${detail ? '  — ' + detail : ''}`);
+};
+const skipped = [];
+const skip = (name, why) => {
+  skipped.push({ name, why });
+  console.log(`SKIP  ${name}  — ${why}`);
 };
 const flush = async () => { for (let i = 0; i < 4; i++) await new Promise(resolve => setImmediate(resolve)); };
 
@@ -278,6 +284,13 @@ function createPage(model, { hud = true, mediaCapabilities = 'safari', source = 
         : { supported: true, smooth: true, powerEfficient: !/av01/i.test(config.video.contentType) }),
     };
   }
+  // 只记脚本自己建的定时器（模拟网络/播放器的定时器直接走 clock，不算），用于判断脚本定时器是否随时间增长。
+  const scriptTimers = new Set();
+  const scriptTimer = id => { scriptTimers.add(id); return id; };
+  const liveScriptTimers = () => {
+    for (const id of scriptTimers) if (!clock.timers.has(id)) scriptTimers.delete(id);
+    return scriptTimers.size;
+  };
   class FakeDate extends Date { static now() { return clock.now; } }
   const windowListeners = new Emitter();
   const sandbox = {
@@ -293,9 +306,9 @@ function createPage(model, { hud = true, mediaCapabilities = 'safari', source = 
     navigator,
     performance: { now: () => clock.perf() },
     Date: FakeDate,
-    setTimeout: (fn, ms, ...args) => clock.setTimeout(fn, ms, ...args),
+    setTimeout: (fn, ms, ...args) => scriptTimer(clock.setTimeout(fn, ms, ...args)),
     clearTimeout: id => clock.clear(id),
-    setInterval: (fn, ms, ...args) => clock.setInterval(fn, ms, ...args),
+    setInterval: (fn, ms, ...args) => scriptTimer(clock.setInterval(fn, ms, ...args)),
     clearInterval: id => clock.clear(id),
     queueMicrotask,
     fetch,
@@ -383,7 +396,7 @@ function createPage(model, { hud = true, mediaCapabilities = 'safari', source = 
   const bufferAhead = () => (video ? video.bufferedEnd - video.currentTime : 0);
   const hudText = () => elements.get('bili-boost-hud')?.textContent || '';
 
-  return { clock, net, api, sandbox, logs, setPlayinfo, attachVideo, startPlayback, stopPlayback, requestSegment,
+  return { clock, net, api, sandbox, logs, liveScriptTimers, setPlayinfo, attachVideo, startPlayback, stopPlayback, requestSegment,
     player, bufferAhead, hudText, get hud() { return elements.get('bili-boost-hud') || null; }, get video() { return video; } };
 }
 
@@ -794,14 +807,29 @@ async function openRound(seed, source = SCRIPT) {
   await page.clock.advance(30_000);
   return { page, result: page.api.测速结果 };
 }
+// 旧版对照默认取 origin/main（没有就取 main）；QA_LEGACY_REF 可指定任意 ref（叠层 PR 想对照它的 base 分支时用）。
+const LEGACY_REFS = process.env.QA_LEGACY_REF ? [process.env.QA_LEGACY_REF] : ['origin/main', 'main'];
 function legacySource() {
-  for (const ref of ['origin/main', 'main']) {
+  for (const ref of LEGACY_REFS) {
     try {
       return execFileSync('git', ['show', `${ref}:bili-boost.user.js`], {
         cwd: new URL('..', import.meta.url), encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
     } catch { }
   }
   return null;
+}
+// 旧版对照的兜底：读不到旧版、旧版已含本改动（叠层 PR 合进 main 后）、旧版缺接口跑不动时记 SKIP，不算 FAIL 也不中断整套回归。
+// marker 是本改动引入的标识符：旧版里已有它，说明旧版不再是「改动前」，对照没有意义。
+async function contrastRun(name, marker, run, assess) {
+  // marker 必须仍在当前脚本里，否则改名后旧版永远「不含本改动」，合并后对照又会误报。
+  if (!marker.test(SCRIPT)) return check(`${name}（对照标识仍在当前脚本）`, false, `当前脚本找不到 ${marker.source}，请同步 marker`);
+  const legacy = legacySource();
+  if (!legacy) return skip(name, `读不到旧版（${LEGACY_REFS.join(' / ')}）`);
+  if (legacy === SCRIPT) return skip(name, '旧版与当前脚本相同');
+  if (marker.test(legacy)) return skip(name, `旧版已含本改动（${marker.source}），无可对照`);
+  let old;
+  try { old = await run(legacy); } catch (error) { return skip(name, `旧版跑不起来：${error?.message || error}`); }
+  assess(old);
 }
 async function scenarioRealPrior() {
   // 会话 1：手选 cosov，在暂停态拉 6 片真实分片（间隔 8 秒，跨过 30 秒落盘节流）。
@@ -901,13 +929,16 @@ const QUALITY_PATHS = { 112: '/upgcxcode/09/61/1234567/1234567-1-30112.m4s', 80:
 const QUALITY_BW = { 112: 4_194_304, 80: VIDEO_BANDWIDTH, 64: 1_048_576, 32: 524_288 };
 // 播放器只拉视频分片（脚本没见到音频路径），需求按视频算：80 档 256KB/s（降档门槛 1.2× = 307，回升门槛 1.5× = 384），
 // 64 档 128KB/s（1.2× = 154）。
-function qualityPage() {
-  const net = { bw: 290 };
-  const page = createPage({ speed: () => net.bw }, { hud: true });
+function setQualityPlayinfo(page) {
   const video = Object.entries(QUALITY_PATHS).map(([qn, path]) => ({ id: Number(qn), codecid: 12, codecs: 'hev1.1.6.L120.90',
     bandwidth: QUALITY_BW[qn], width: 1920, height: 1080, frameRate: '30.000', baseUrl: `https://${H('cosov')}${path}?e=sig` }));
   page.sandbox.__playinfo__ = { code: 0, data: { accept_quality: [112, 80, 64, 32], dash: { video,
     audio: [{ id: 30280, codecid: 0, codecs: 'mp4a.40.2', bandwidth: AUDIO_BANDWIDTH, baseUrl: `https://${H('cosov')}${AUDIO_PATH}?e=sig` }] } } };
+}
+function qualityPage() {
+  const net = { bw: 290 };
+  const page = createPage({ speed: () => net.bw }, { hud: true });
+  setQualityPlayinfo(page);
   const calls = [];
   const state = { nowQ: 80 };
   const setQuality = qn => { state.nowQ = qn; page.player.path = QUALITY_PATHS[qn]; };
@@ -1003,6 +1034,296 @@ async function scenarioQualityRestore() {
   stall.page.stopPlayback();
 }
 
+// 场景 10：码率告警里的旧数据时效。开播测速时各源都 600KB/s，之后整体网速掉到 200（< 码率 272）。
+// 缓冲一直不足 15 秒 → 禁测，其他源的 600 旧探测值没人刷新。旧版靠它判“还有源够快”，永远不告警、不降档。
+const DEGRADE_AT = 60_000;
+async function degradeRun(source = SCRIPT, { autoDowngrade = false, onlyCurrent = false, slowKbps = 200, minutes = 8,
+  degradeAt = DEGRADE_AT, manual = false, otherKbps = 600 } = {}) {
+  let t0 = null;
+  const slow = (host, now) => t0 != null && now - t0 >= degradeAt && (!onlyCurrent || host === H('cosov'));
+  const page = createPage({ speed: (host, offset, kind, now) => (slow(host, now) ? slowKbps : host === H('cosov') ? 600 : otherKbps) }, { hud: true, source });
+  t0 = page.clock.now;
+  setQualityPlayinfo(page);
+  const calls = [];
+  const state = { nowQ: 80 };
+  page.player.path = QUALITY_PATHS[80];
+  page.sandbox.player = { getQuality: () => ({ nowQ: state.nowQ }), requestQuality: qn => {
+    calls.push({ qn, at: page.clock.now - t0 }); state.nowQ = qn; page.player.path = QUALITY_PATHS[qn]; } };
+  if (autoDowngrade) page.api.自动降档(true);
+  page.startPlayback({ host: H('cosov') });
+  if (manual) { await page.clock.advance(5_000); page.api.手动选源(H('cosov')); }
+  let warnAt = null;
+  let warnHud = '';
+  let earlyWarn = false;
+  const timersBefore = page.clock.timers.size;
+  let minAhead = Infinity;
+  for (let t = 0; t < minutes * 60_000; t += 5_000) {
+    await page.clock.advance(5_000);
+    if (t >= degradeAt) minAhead = Math.min(minAhead, page.bufferAhead());
+    const warn = page.api.码率.告警;
+    if (!warn) continue;
+    if (warnAt == null) { warnAt = page.clock.now - t0; warnHud = page.hudText(); }
+    // 最近一轮测速还新鲜（<3 分钟）时，旧逻辑照常：其他源的新数据够快就不该告警。
+    const roundTs = page.api.测速结果?.ts;
+    if (roundTs && page.clock.now - roundTs < 180_000 && warn.stale === 0 && warn.best >= 600 * 0.9) earlyWarn = true;
+  }
+  const out = { page, t0, stalls: page.api.卡顿次数, calls, warnAt, probes: page.net.probes.length, minAhead, warnHud, earlyWarn, warn: page.api.码率.告警, source: page.api.当前源,
+    timersGrew: page.clock.timers.size > timersBefore };
+  page.stopPlayback();
+  return out;
+}
+async function scenarioStaleEvidence() {
+  const run = await degradeRun();
+  check('10 整体降速且禁测时，其他源的旧探测值 3 分钟后不再撑住码率告警',
+    run.warnAt != null && run.warnAt > DEGRADE_AT && run.warnAt <= DEGRADE_AT + 180_000 + 60_000 && !run.earlyWarn &&
+    run.warn?.stale >= 1 && /未计入/.test(run.warnHud) && run.calls.length === 0,
+    `降速后 ${run.warnAt == null ? '从不' : Math.round((run.warnAt - DEGRADE_AT) / 1000) + 's'} 告警；告警=${JSON.stringify(run.warn)}；` +
+    `HUD=${JSON.stringify(run.warnHud.split('\n').find(line => /码率/.test(line)) || '')}`);
+  await contrastRun('10 对照：旧版（origin/main）同场景 8 分钟内从不告警', /staleBest/, legacy => degradeRun(legacy),
+    old => check('10 对照：旧版（origin/main）同场景 8 分钟内从不告警', old.warnAt == null,
+      `旧版告警时间=${old.warnAt}；新版=${run.warnAt}`));
+  const auto = await degradeRun(SCRIPT, { autoDowngrade: true });
+  check('10 打开自动降档时，旧数据过期后真正降一档（80→64），只降一次',
+    auto.calls.length === 1 && auto.calls[0].qn === 64 && auto.calls[0].at > DEGRADE_AT && !auto.timersGrew,
+    `requestQuality=${JSON.stringify(auto.calls)}；${auto.page.api.码率.说明}`);
+  // 当前源 290：够 1.0× 码率（缓冲不掉），不够 1.2×；其他源其实仍有 600。旧数据过期后不该直接告警/降档，
+  // 而是在缓冲充足时补测一轮拿新数据——新数据证明还有快源，就不告警。
+  const only = await degradeRun(SCRIPT, { autoDowngrade: true, onlyCurrent: true, slowKbps: 290 });
+  const firstProbes = (await degradeRun(SCRIPT, { onlyCurrent: true, slowKbps: 290, minutes: 1 })).probes;
+  check('10 当前源略低于 1.2×、缓冲充足、其他源旧数据过期：先补测拿新数据，不误告警、不降档',
+    only.warnAt == null && only.calls.length === 0 && only.probes > firstProbes && only.minAhead >= 15 && !only.timersGrew,
+    `告警=${only.warnAt}；降档=${JSON.stringify(only.calls)}；探测 ${firstProbes} → ${only.probes} 次；降速后最低缓冲 ${only.minAhead.toFixed(1)}s；` +
+    `测速原因=${only.page.api.测速结果?.why}；当前源=${shortHost(only.source)}`);
+
+  // 其他源自己的真实分片还新鲜（<3 分钟）时照常计入：刚从 08c（600）手动切到 cosov（290），不告警也不需要补测。
+  const page = createPage({ speed: host => (host === H('cosov') ? 290 : 600) }, { hud: true });
+  page.setPlayinfo();
+  page.sandbox.player = { getQuality: () => ({ nowQ: 80 }), requestQuality: () => { } };
+  page.startPlayback({ host: H('cosov') });
+  await page.clock.advance(5_000);
+  page.api.手动选源(H('08c'));
+  await page.clock.advance(225_000);           // 08c 播 3 分多钟，开播那轮测速已过期
+  page.api.手动选源(H('cosov'));
+  const probesAt = page.net.probes.length;
+  let warned = false;
+  for (let t = 0; t < 120_000; t += 5_000) { await page.clock.advance(5_000); warned ||= !!page.api.码率.告警; }
+  const real = page.api.真实速度;
+  check('10 其他源的真实分片还新鲜时照常计入（刚切走的快源撑住告警），不额外补测',
+    !warned && page.net.probes.length === probesAt && /08c/.test(Object.keys(real).join()) && page.api.当前源 === H('cosov'),
+    `告警=${warned}；补测 ${page.net.probes.length - probesAt} 次；真实速度=${JSON.stringify(real)}`);
+  page.stopPlayback();
+}
+
+// 场景 11：当前源连续 3 片真实分片低于码率、还没卡：用已有的新鲜数据主动切到够快的源，不等卡顿。
+const short = host => String(host || '').replace(/^upos-sz-mirror|\.bilivideo\.com$/g, '');
+const slowSwitches = run => run.page.api.切源记录.filter(item => /跟不上码率/.test(item.why));
+function describeRun(run) {
+  return `切源=${run.page.api.切源记录.map(item => `${short(item.from)}→${short(item.to)}@${Math.round((item.at - run.t0) / 1000)}s(${item.why})`).join('，') || '无'}；` +
+    `卡顿 ${run.stalls} 次；降速后最低缓冲 ${run.minAhead.toFixed(1)}s；当前源=${short(run.source)}；探测 ${run.probes} 次`;
+}
+async function scenarioSlowSegments() {
+  // 码率 272，cosov 在 60 秒后掉到 150（< 码率），其他源仍 600（开播测速新鲜）。
+  const run = await degradeRun(SCRIPT, { onlyCurrent: true, slowKbps: 150, minutes: 4 });
+  const first = slowSwitches(run)[0];
+  check('11 当前源连续 3 片低于码率 → 不等卡顿，按新鲜测速主动切到够快的源',
+    first && first.from === H('cosov') && first.at - run.t0 <= DEGRADE_AT + 30_000 && run.source !== H('cosov') &&
+    run.stalls === 0 && run.minAhead >= 10 && !run.timersGrew, describeRun(run));
+  await contrastRun('11 对照：旧版（origin/main）同场景要等缓冲见底、确认卡顿后才切', /switchOnSlowSegments/,
+    legacy => degradeRun(legacy, { onlyCurrent: true, slowKbps: 150, minutes: 4 }),
+    old => check('11 对照：旧版（origin/main）同场景要等缓冲见底、确认卡顿后才切',
+      old.stalls >= 1 && old.minAhead < 1, `旧版：卡顿 ${old.stalls} 次，降速后最低缓冲 ${old.minAhead.toFixed(1)}s；新版：卡顿 ${run.stalls} 次`));
+  // 整体网速掉到 240（略低于码率，缓冲慢慢掉、不卡）：开播测速还新鲜时可能照着它试切，
+  // 但刚连续跟不上的源不再选回（不 A↔B 横跳），测速过期后就停手；每次间隔 ≥60 秒。
+  const all = await degradeRun(SCRIPT, { slowKbps: 240, minutes: 8 });
+  const allSlow = slowSwitches(all);
+  const left = new Set();
+  let back = false;
+  let lastAt = -Infinity;
+  let gapOk = true;
+  for (const item of allSlow) {
+    back ||= left.has(item.to);
+    left.add(item.from);
+    gapOk &&= item.at - lastAt >= 60_000;
+    lastAt = item.at;
+  }
+  const lastSlowAt = allSlow.length ? allSlow.at(-1).at - all.t0 : 0;
+  check('11 所有源都跟不上时不在慢源之间来回切：不切回刚跟不上的源、间隔 ≥60 秒、测速过期后停手',
+    allSlow.length >= 1 && !back && gapOk && lastSlowAt <= 180_000 + 60_000 && !all.timersGrew, describeRun(all));
+  // 其他源测速只有 250（< 码率 272）：切过去也跟不上，不主动切（交给码率告警/降档）。
+  const weak = await degradeRun(SCRIPT, { onlyCurrent: true, slowKbps: 150, otherKbps: 250, minutes: 3 });
+  check('11 候选源也跟不上码率时不主动切源', slowSwitches(weak).length === 0, describeRun(weak));
+  // 用户手选的源不动（卡顿后的原有逻辑不变）。
+  const man = await degradeRun(SCRIPT, { onlyCurrent: true, slowKbps: 150, minutes: 4, manual: true });
+  check('11 手选源连续低于码率时不主动切源', slowSwitches(man).length === 0, describeRun(man));
+  // 开播测速已过期（4 分钟后才降速）：其他源只有旧数字，不凭它主动切；交给码率告警的补测。
+  const late = await degradeRun(SCRIPT, { onlyCurrent: true, slowKbps: 150, minutes: 8, degradeAt: 240_000 });
+  check('11 其他源只有过期（>3 分钟）测速时不凭旧数字主动切源', slowSwitches(late).length === 0, describeRun(late));
+}
+// 场景 12：开播快筛结论即时生效。原始源 cosov 只有 120KB/s（< 码率 272），08c 900。
+// 旧版快筛在首帧前就跑完了，但要等精测（缓冲 ≥15 秒，最多等 20 秒）才切，缓冲涨不上去，只能卡一次后才切。
+async function startupRun(source = SCRIPT, { caps = {}, liarHead = 0, manual = null, paused = false, seconds = 60 } = {}) {
+  const model = {
+    speed(host, offset) {
+      if (liarHead && host === H('hw')) return offset < liarHead ? 40_000 : 120;
+      return caps[host] ?? 300;
+    },
+    ttfb: () => 120,
+  };
+  const page = createPage(model, { hud: false, source });
+  page.setPlayinfo(H('cosov'));
+  page.startPlayback({ host: H('cosov') });
+  if (paused) page.video.paused = true;   // 未自动播放：播放器照常预载，快筛不受缓冲门控影响、总能跑完
+  const t0 = page.clock.now;
+  if (manual) {
+    // 首个分片发出后（脚本已认出媒体目录、开播快筛正在跑）用户手选。
+    await page.clock.advance(300);
+    page.api.手动选源(manual);
+  }
+  let firstFrame = null;
+  page.video.addEventListener('timeupdate', () => { firstFrame ??= page.clock.now - t0; });
+  let minAhead = Infinity;
+  const timersAfterStart = page.clock.timers.size;
+  for (let i = 0; i < seconds; i++) {
+    await page.clock.advance(1000);
+    if (page.clock.now - t0 > 6000) minAhead = Math.min(minAhead, page.bufferAhead());
+  }
+  const log = page.api.切源记录;
+  return { page, t0, firstFrame, minAhead, stalls: page.api.卡顿次数, log, quick: log.filter(item => item.why === '开播快筛'),
+    source: page.api.当前源, timersGrew: page.clock.timers.size > timersAfterStart + 1,
+    text: `切源=${log.map(item => `${short(item.from)}→${short(item.to)}@${((item.at - t0) / 1000).toFixed(1)}s(${item.why})`).join('，') || '无'}；` +
+      `首帧 ${firstFrame}ms；卡顿 ${page.api.卡顿次数} 次；6 秒后最低缓冲 ${minAhead.toFixed(1)}s；当前源=${short(page.api.当前源)}；探测 ${page.net.probes.length} 次` };
+}
+async function scenarioStartupQuick() {
+  const slowOrig = { [H('cosov')]: 120, [H('08c')]: 900 };
+  const run = await startupRun(SCRIPT, { caps: slowOrig });
+  const first = run.quick[0];
+  check('12 原始源慢：快筛一跑完就切到快源（不等精测），开播 60 秒 0 卡顿',
+    run.quick.length === 1 && first.from === H('cosov') && first.to === H('08c') && first.at - run.t0 <= 6_000 &&
+    run.stalls === 0 && run.source === H('08c') && !run.timersGrew, run.text);
+  await contrastRun('12 对照：旧版（origin/main）同场景要卡一次才切走', /applyStartupQuick/,
+    legacy => startupRun(legacy, { caps: slowOrig }),
+    old => check('12 对照：旧版（origin/main）同场景要卡一次才切走', old.stalls >= 1 && run.stalls < old.stalls,
+      `旧版：${old.text}`));
+  // 精测照跑，并且能修正暂定结论：快筛后 08c 不计入限频，精测/卡顿/跟不上码率仍可随时切。
+  const result = run.page.api.测速结果;
+  check('12 精测照常跑完并确认快筛结论（不再多切一次）',
+    result && !result.incomplete && result.win === H('08c') && run.log.length === 1 && !result.held,
+    `测速结果 win=${short(result?.win)} incomplete=${result?.incomplete} 原因=${result?.why} held=${result?.held}`);
+  // 头部缓存骗过快筛（hw 前 2MB 40000KB/s、之后 120）：暂定切到 hw 后，卡顿路径不被 60 秒限频挡住，立刻纠正。
+  const lie = await startupRun(SCRIPT, { caps: { [H('cosov')]: 120, [H('08c')]: 600 }, liarHead: 2 * MB, seconds: 120 });
+  const fixAt = lie.log.find(item => item.from === H('hw'))?.at;
+  check('12 快筛被头部缓存骗到 hw：暂定切换不占 60 秒限频，30 秒内被纠正，卡顿 ≤1 次',
+    lie.quick[0]?.to === H('hw') && fixAt && fixAt - lie.quick[0].at <= 30_000 && lie.stalls <= 1 && lie.source !== H('hw'), lie.text);
+  await contrastRun('12 对照：同一骗局旧版卡顿更多', /applyStartupQuick/,
+    legacy => startupRun(legacy, { caps: { [H('cosov')]: 120, [H('08c')]: 600 }, liarHead: 2 * MB, seconds: 120 }),
+    old => check('12 对照：同一骗局旧版卡顿更多', old.stalls > lie.stalls, `旧版：${old.text}`));
+  // 原始源够用（500 vs 08c 560，快不到 25%；快筛跑完时 cosov 真实分片不足 3 片，滞回兜不住，只能靠这道门槛）：不做暂定切换。暂停预载，确保快筛跑完、确实走到这道门槛。
+  const fine = await startupRun(SCRIPT, { caps: { [H('cosov')]: 500, [H('08c')]: 560 }, paused: true });
+  const fineProbed = fine.page.api.测速结果?.list.length;
+  check('12 原始源已够用（候选快不到 25%）时不暂定切换', fine.quick.length === 0 && fineProbed >= 6, `测到 ${fineProbed} 个源；${fine.text}`);
+  // 所有候选都 < 1.2×码率（300 < 326）：切过去也没余量，不暂定切换。
+  const weak = await startupRun(SCRIPT, { caps: { [H('cosov')]: 120, [H('08c')]: 300 } });
+  check('12 候选都不到 1.2×码率时不暂定切换', weak.quick.length === 0, weak.text);
+  // 开播前手选了 cosov：不动。
+  const man = await startupRun(SCRIPT, { caps: slowOrig, manual: H('cosov') });
+  check('12 手选源时不暂定切换', man.quick.length === 0, man.text);
+}
+// 场景 13：叠层功能联合长测（只加测试，不改脚本）。#11 码率旧数据时效、#12 跟不上码率主动切源、#13 开播快筛、
+// 403 拉黑、自动降档/回升各自有单项场景，但从没在同一次播放里先后触发过。这里 30 分钟虚拟播放按阶段依次触发，
+// 看它们叠在一起时：状态/定时器/监听/落盘仍有界，测速并发 =1、缓冲不足不测，计入限频的自动切源间隔 ≥60 秒，播放不断。
+const COMBO_PHASES = [
+  { until: 5 * 60_000, name: '开播原始源慢' },     // cosov 120 → 开播快筛切到 08c
+  { until: 10 * 60_000, name: '08c 跌到码率以下' },  // 08c 150 → 跟不上码率 / 卡顿切走
+  { until: 12 * 60_000, name: 'hw 分片 403' },       // hw 真实分片 403 → 拉黑回退
+  { until: 20 * 60_000, name: '整体降速' },          // 全部 200 → 码率告警、自动降档
+  { until: 30 * 60_000, name: '网速恢复' },          // 全部 900 → 回升
+];
+async function comboRun(source = SCRIPT) {
+  let t0 = null;
+  const at = now => (t0 == null ? 0 : now - t0);
+  const phase = now => COMBO_PHASES.findIndex(item => at(now) < item.until);
+  const page = createPage({
+    speed(host, offset, kind, now) {
+      const p = phase(now);
+      if (p === 0) return host === H('cosov') ? 120 : host === H('08c') ? 900 : host === H('hw') ? 700 : 300;
+      if (p === 1 || p === 2) return host === H('08c') ? 150 : host === H('hw') ? 700 : host === H('cosov') ? 120 : 400;
+      if (p === 3) return 200;
+      return 900;
+    },
+    segmentStatus: (host, now) => (phase(now) === 2 && host === H('hw') ? 403 : 206),
+    ttfb: () => 120,
+  }, { hud: true, source });
+  t0 = page.clock.now;
+  setQualityPlayinfo(page);
+  const calls = [];
+  const state = { nowQ: 80 };
+  page.player.path = QUALITY_PATHS[80];
+  page.sandbox.player = { getQuality: () => ({ nowQ: state.nowQ }), requestQuality: qn => {
+    calls.push({ qn, at: at(page.clock.now) }); state.nowQ = qn; page.player.path = QUALITY_PATHS[qn]; } };
+  page.api.自动降档(true);
+  page.startPlayback({ host: H('cosov') });
+  let waits = 0;
+  page.video.addEventListener('waiting', () => { waits++; });
+  await page.clock.advance(30_000);
+  // 基线取开播 30 秒后（开播测速、HUD 定时器都已就位），之后只许回落不许涨。
+  const base = { timers: page.liveScriptTimers(), listeners: [...page.sandbox.document.listeners.values()].reduce((n, list) => n + list.length, 0) };
+  const switches = new Map();
+  const note = () => { for (const item of page.api.切源记录) switches.set(`${item.at}|${item.from}|${item.to}`, item); };
+  let peakTimers = 0;
+  let peakState = {};
+  let lowBufferProbes = 0;
+  let seenProbes = 0;
+  for (let t = 30_000; t < COMBO_PHASES.at(-1).until; t += 5_000) {
+    await page.clock.advance(5_000);
+    note();
+    peakTimers = Math.max(peakTimers, page.liveScriptTimers());
+    for (const [k, v] of Object.entries(page.api.诊断状态)) if (typeof v === 'number') peakState[k] = Math.max(peakState[k] ?? 0, v);
+    for (; seenProbes < page.net.probes.length; seenProbes++) {
+      const probe = page.net.probes[seenProbes];
+      if (probe.video && !probe.video.paused && probe.video.time > 0.5 && probe.video.ahead < 15) lowBufferProbes++;
+    }
+  }
+  const listeners = [...page.sandbox.document.listeners.values()].reduce((n, list) => n + list.length, 0);
+  const storageChars = [...page.sandbox.localStorage.map].reduce((n, [key, value]) => n + key.length + value.length, 0);
+  const log = [...switches.values()].sort((a, b) => a.at - b.at);
+  const limited = log.filter(item => item.why !== '开播快筛' && !/拉黑/.test(item.why));
+  const gaps = limited.slice(1).map((item, i) => item.at - limited[i].at);
+  const out = { page, t0, calls, log, limited, gaps, base, peakTimers, endTimers: page.liveScriptTimers(), listeners,
+    peakState, endState: page.api.诊断状态, lowBufferProbes, probePeak: page.net.probePeak, storageChars,
+    stalls: page.api.卡顿次数, waits, played: page.video.currentTime, aborts: page.net.xhrAborts,
+    text: `切源=${log.map(item => `${short(item.from)}→${short(item.to)}@${Math.round((item.at - t0) / 1000)}s(${item.why})`).join('，') || '无'}；` +
+      `清晰度=${[80, ...calls.map(call => call.qn)].join('→')}；卡顿 ${page.api.卡顿次数} 次；播放到 ${Math.round(page.video.currentTime)}s` };
+  page.stopPlayback();
+  return out;
+}
+async function scenarioCombined() {
+  const run = await comboRun();
+  const whys = run.log.map(item => item.why);
+  // 只要求各功能都被走到，不规定 08c 走哪条路被切走（现在是码率告警的补测先到，跟不上码率在整体降速时触发）。
+  check('13 联合长测：各阶段的功能都真的触发了（开播快筛、08c 变慢后被自动切走、跟不上码率、403 拉黑、降档、回升）',
+    whys.includes('开播快筛') && run.log.some(item => item.from === H('08c') && item.at - run.t0 < COMBO_PHASES[1].until) &&
+    whys.some(why => /跟不上码率/.test(why)) &&
+    whys.some(why => /HTTP 403/.test(why)) && run.calls.some(call => call.qn < 80) &&
+    run.calls.length >= 2 && run.calls.at(-1).qn > Math.min(...run.calls.map(call => call.qn)), run.text);
+  check('13 联合长测：计入限频的自动切源间隔都 ≥60 秒（开播快筛、403 拉黑除外），30 分钟内切源 ≤12 次',
+    run.gaps.every(gap => gap >= 60_000) && run.log.length <= 12,
+    `计入限频 ${run.limited.length} 次，间隔(s)=${run.gaps.map(gap => Math.round(gap / 1000)).join(',') || '—'}；全部 ${run.log.length} 次`);
+  check('13 联合长测：测速并发 =1，播放中缓冲 <15 秒不发探测',
+    run.probePeak <= 1 && run.lowBufferProbes === 0, `并发峰值=${run.probePeak}，缓冲不足时探测 ${run.lowBufferProbes} 次，探测共 ${run.page.net.probes.length} 次`);
+  const p = run.peakState;
+  check('13 联合长测：状态有界（perf≤6、切源记录≤8、黑名单≤64、健康档≤32、真实速度≤源数、localStorage≤16KB）',
+    p.perf <= 6 && p.switches <= 8 && p.blacklist <= 64 && p.health <= 32 && p.realHosts <= 12 &&
+    p.probeControllers <= 1 && p.probing <= 1 && p.pendingProbe <= 1 && p.warningTimers <= 1 && run.storageChars <= 16 * 1024,
+    `峰值=${JSON.stringify(p)}，localStorage ${run.storageChars} 字符`);
+  check('13 联合长测：脚本定时器与文档监听不随时间增长，结束时没有挂着的测速',
+    run.peakTimers <= run.base.timers + 2 && run.endTimers <= run.base.timers && run.listeners === run.base.listeners &&
+    run.endState.probing === 0 && run.endState.probeControllers === 0,
+    `脚本定时器 基线 ${run.base.timers} / 峰值 ${run.peakTimers} / 结束 ${run.endTimers}；监听 ${run.base.listeners} → ${run.listeners}；结束 probing=${run.endState.probing}`);
+  // 模拟播放器每片固定 512KB、不随清晰度变小，降档后整体降速阶段仍会反复短暂见底（waiting），属于测试桩的局限。
+  check('13 联合长测：播放不断（不 abort 播放器分片，30 分钟至少播放 25 分钟）',
+    run.aborts === 0 && run.played >= 25 * 60,
+    `abort=${run.aborts}，播放到 ${Math.round(run.played)}s，确认卡顿 ${run.stalls} 次，播放器 waiting ${run.waits} 次`);
+}
 async function contrast() {
   let legacy;
   try {
@@ -1023,7 +1344,54 @@ async function contrast() {
     `v1.7.0 探测 ${newFlap.probes} 次 / 缓冲不足时 ${newFlap.lowBufferProbes} 次 / 卡顿 ${newFlap.stalls} / 并发峰值 ${newFlap.peak}`);
 }
 
+async function scenarioManualProbe() {
+  const page = createPage({ speed: host => host === H('08c') ? 2400 : 800 }, { hud: true });
+  page.setPlayinfo();
+  const video = page.attachVideo();
+  video.currentTime = 10;
+  video.bufferedEnd = 11;
+  video.paused = false;
+  video.readyState = 2;
+  page.requestSegment();
+  await page.clock.advance(1000);
+  check('14 低缓冲自动测速被门控', page.net.probes.length === 0 && page.api.诊断状态.probeBlocked > 0);
+  const click = () => page.hud.emitLocal('click', {
+    target: { closest: () => ({ dataset: { action: 'probe' } }) }, stopPropagation() { }
+  });
+  check('14 折叠 HUD 常驻测速、诊断及带宽提示', /data-action="probe"/.test(page.hud.innerHTML) &&
+    /data-action="copy-diag"/.test(page.hud.innerHTML) && /测速会短暂占用带宽/.test(page.hudText()));
+  click();
+  await page.clock.advance(100);
+  const progress = /测速中.*第 \d+\/\d+ 个源/.test(page.hudText());
+  click(); click();
+  check('14 测速中连点合并为一轮排队，不并发', progress && page.api.诊断状态.probing === 1 &&
+    page.api.诊断状态.pendingProbe === 1 && /已排队/.test(page.hudText()));
+  const rounds = new Set();
+  for (let t = 0; t < 60_000; t += 100) {
+    await page.clock.advance(100);
+    if (page.api.测速结果) rounds.add(page.api.测速结果.ts);
+  }
+  check('14 低缓冲手动完整执行两轮，全局并发 1、无遗留 controller', rounds.size === 2 &&
+    page.net.probes.length > 0 && page.net.probes.every(item => item.video.ahead < 15) && page.net.probePeak === 1 &&
+    page.api.诊断状态.probing === 0 && page.api.诊断状态.pendingProbe === 0 && page.api.诊断状态.probeControllers === 0,
+    `轮数=${rounds.size} 探测=${page.net.probes.length} 并发=${page.net.probePeak}`);
+  page.hud.click(); // 结果自动收起后重新展开
+  const results = page.api.测速结果;
+  check('14 结果逐源显示有效速度/TTFB/拉黑状态，标记与当前源一致', results?.list.length >= 6 &&
+    results.win === page.api.当前源 && page.hud.innerHTML.includes(`data-result-host="${page.api.当前源}" data-selected="true"`) &&
+    /选择原因：/.test(page.hudText()) && /未拉黑/.test(page.hudText()) &&
+    results.list.every(item => page.hudText().includes(String(item.fusedKbps || item.effectiveKbps || item.kbps || 0))));
+
+  // 迟到的排队手动测速不能跨视频执行。
+  click(); click();
+  page.sandbox.location.pathname = '/video/BV1MANUALRESET/';
+  await page.clock.advance(2000);
+  check('14 换视频作废正在测速的进度与排队', page.api.诊断状态.probing === 0 &&
+    page.api.诊断状态.pendingProbe === 0 && !/测速中/.test(page.hudText()));
+}
+
 const started = Date.now();
+await scenarioManualProbe();
 await scenarioRepresentative();
 await scenarioFusion();
 await scenarioFlapping();
@@ -1036,7 +1404,11 @@ await scenarioBanRecovery();
 await scenarioDiagnostics();
 await scenarioRealPrior();
 await scenarioQualityRestore();
+await scenarioStaleEvidence();
+await scenarioSlowSegments();
+await scenarioStartupQuick();
+await scenarioCombined();
 if (CONTRAST) await contrast();
 const failed = results.filter(item => !item.pass);
-console.log(`\n=== qa-stall：PASS=${results.length - failed.length} FAIL=${failed.length}，耗时 ${((Date.now() - started) / 1000).toFixed(1)}s ===`);
+console.log(`\n=== qa-stall：PASS=${results.length - failed.length} FAIL=${failed.length}${skipped.length ? ` SKIP=${skipped.length}` : ''}，耗时 ${((Date.now() - started) / 1000).toFixed(1)}s ===`);
 process.exit(failed.length ? 1 : 0);
