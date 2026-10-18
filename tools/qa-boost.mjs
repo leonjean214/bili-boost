@@ -1356,6 +1356,7 @@ async function main() {
           const result = api.测速结果;
           return {
             win: result?.win || null,
+            allFailed: !!result && result.list.length > 0 && result.list.every(item => !item.ok),
             precise: result?.list.find(item => item.host === ${JSON.stringify(candidate08h)} && item.ok && item.points?.length === 2) != null,
             source: api.当前源,
             blacklisted: api.黑名单.includes(${JSON.stringify(candidate08h)}),
@@ -1366,7 +1367,8 @@ async function main() {
         const pass = available
           ? attempted && audit.win === candidate08h && audit.precise &&
             audit.source === candidate08h && !audit.blacklisted && audit.manual.includes(candidate08h)
-          : attempted && audit.win === null && audit.source === original && audit.blacklisted;
+          : attempted && audit.win === original && audit.allFailed && !audit.precise &&
+            audit.source === original && audit.blacklisted;
         addResult(name, pass ? 'PASS' : 'FAIL', {
           reason: pass ? (available ? '08h 经头部/中段测速后可自动及手动选择' : '08h 测速失败后加入黑名单并沿用原始源') :
             JSON.stringify({ attempted, audit, requested }),

@@ -26,21 +26,23 @@
 - 各源结果标记按 `currentCdnSource()`（与 `__biliBoost.当前源` 相同）而不是历史赢家；无可用候选也保留本轮失败明细。
 - `@grant none`、`@inject-into page` 与 `IS_TOP` HUD 保护不变；不加依赖、不加定时器或每按钮监听。
 
-## 本轮验证状态：BLOCKED（Win 离线）
+## 本轮验证状态：Win 回归通过（保留既有 SKIP）
 
-已通过：
+首轮因 Win 离线未能运行测试；2026-10-17 用户恢复 Win，SSH 返回 ready，随后完成以下实际运行。所有测试在 Win 执行，Mac 只编排、git 与静态检查。
 
-- `node --check bili-boost.user.js`
-- `node --check tools/qa-boost.mjs`
-- `node --check tools/qa-stall.mjs`
-- `git diff --check`
+| 验证 | 命令 / 条件 | 结果 |
+|---|---|---|
+| 旧版 red | 临时使用 `2082c4c:bili-boost.user.js`、保留新版测试；`QA_ARGS='--manual-probe-only' QA_TIMEOUT_SECONDS=240 ./tools/qa-on-win.sh`，trap 恢复实现 | rc=1；PASS=0 FAIL=2 SKIPPED=0，4.1s；有/无 AV1 均 `automaticBlocked:true, hasButton:false` |
+| 新版 green | 恢复实现后同一命令 | rc=0；PASS=2 FAIL=0 SKIPPED=0，7.4s；9 项检查在两种 AV1 环境均 true |
+| 完整首轮 | `QA_TIMEOUT_SECONDS=1200 node tools/qa-boost.mjs`（自动转交 Win） | rc=1；PASS=35 FAIL=1 SKIPPED=2；定位到旧测试对“无可用候选”的结果存储假设已不适用 |
+| 完整重跑 | 修正断言后同一命令 | rc=0；PASS=36 FAIL=0 SKIPPED=2，229.1s；内含 qa-stall PASS=77 FAIL=0 SKIP=4 |
+| 独立模拟回归 | scp 当前脚本及 qa-stall 至唯一 Win 暂存目录，`ssh win-desktop 'node bili-manual-probe-sim-20261017\tools\qa-stall.mjs'` | rc=0；PASS=77 FAIL=0 SKIP=4，1.6s |
+| 静态 | `node --check` 三份脚本及 `git diff --check` | 全通过 |
 
-未完成（不能当 PASS）：
+唯一修复：`新增 CDN 候选（不可用回退）` 原先要求全失败时没有测速结果。本版按任务要求保留失败明细并标明保持原始源，因此改为严格断言 `win === original && allFailed && !precise && source === original && blacklisted`。不是把失败候选当成功，也未改产品逻辑或放宽资源预算。首轮完整失败日志先证明了断言问题，修复后整套重跑通过。
 
-- 新增场景在旧脚本上的失败运行、修复后的通过运行（red/green）。场景在产品修改前先写，但测试环境不可达，未能执行红灯。
-- Win `node tools/qa-stall.mjs`、定向 `QA_ARGS='--manual-probe-only' ./tools/qa-on-win.sh`、完整 `node tools/qa-boost.mjs`。
-- Safari 真机（按任务留给 Claude，不尝试打开 GUI）。
+SKIP 不冒充通过：
+- 浏览器 2 项：多 P 切 P、切清晰度，未登录流已内联 `__playinfo__`，播放器不重新请求 playurl。
+- 模拟 4 项：场景 10、11、12（两项）的历史对照，Win 暂存目录无可读 `origin/main / main`。当前版 77 项断言均执行；手动按钮另有上表独立的真实旧版 red 证据。
 
-连接证据：`tailscale status` 显示 win-host 离线、last seen 16h；`ssh -o ConnectTimeout=10 win-desktop` 超时；备用 `win-lan`（192.0.2.10）返回 Host is down。尝试调度定向 QA 时仍卡在远端传输，45 秒工具超时，未启动浏览器测试；没有绕到 Mac 执行测试。
-
-草稿 PR 不应合并。唯一恢复前置条件是 Win 开机联网、SSH 可达；恢复后先做定向 red/green，再跑完整 QA。Safari 步骤与具体续跑命令见执行者的本地 `.ai/HANDOFF.md`。
+Safari 真机未执行，按用户要求由 Claude 后续操作。PR #16 继续 Draft，不合并、不关闭 #11–#15。详细命令、原始日志位置与 Safari 步骤见 `.ai/HANDOFF.md`。
