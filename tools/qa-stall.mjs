@@ -1379,7 +1379,7 @@ async function scenarioManualProbe() {
   const results = page.api.测速结果;
   check('14 结果逐源显示有效速度/TTFB/拉黑状态，标记与当前源一致', results?.list.length >= 6 &&
     results.win === page.api.当前源 && page.hud.innerHTML.includes(`data-result-host="${page.api.当前源}" data-selected="true"`) &&
-    /选择原因：/.test(page.hudText()) && /未拉黑/.test(page.hudText()) &&
+    /选择原因：/.test(page.hudText()) && /↳/.test(page.hudText()) && !/未拉黑/.test(page.hudText()) &&
     results.list.every(item => page.hudText().includes(String(item.fusedKbps || item.effectiveKbps || item.kbps || 0))));
 
   // 迟到的排队手动测速不能跨视频执行。
