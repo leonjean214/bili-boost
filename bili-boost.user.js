@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         哔哩哔哩播放优化（CDN 测速切源 + 强制硬解编码）
 // @namespace    https://github.com/leonjean214/bili-boost
-// @version      1.8.0
+// @version      1.8.1
 // @description  CDN 测速切源（播放前方测速点 + 真实分片融合 + 滞回防横跳 + 缓冲不足禁测），并剔除 AV1、优先 HEVC/H.264，降低海外播放卡顿与软解发热。
 // @author       leonjean214
 // @match        *://*.bilibili.com/*
@@ -344,7 +344,7 @@
   // 但 B站有同源 iframe（如登录轮询用的 /correspond/），脚本在里面照样会跑，
   // 那里既不是视频页也拦不到分片。HUD 必须只由顶层窗口绘制，
   // 否则 iframe 会画出第二个 HUD，内容是「没拦到分片请求 / 未检测编码」。
-  const SCRIPT_VERSION = 'v1.8.0';   // ⚠️ 改版本时要和文件头的 @version 一起改
+  const SCRIPT_VERSION = 'v1.8.1';   // ⚠️ 改版本时要和文件头的 @version 一起改
 
   const IS_TOP = (() => { try { return window.top === window.self; } catch (e) { return false; } })();
 
@@ -2345,8 +2345,8 @@
     box.style.cssText = 'position:fixed;right:12px;bottom:12px;z-index:2147483647;background:rgba(18,18,20,.97);' +
       '-webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px);' +
       'color:#ddd;font:11px/1.55 ui-monospace,Menlo,monospace;padding:6px 10px;border-radius:7px;' +
-      'border:1px solid rgba(255,255,255,.08);' +
-      'box-shadow:0 3px 14px rgba(0,0,0,.5);white-space:pre;transition:opacity .4s;cursor:pointer;' +
+      'border:1px solid rgba(255,255,255,.08);max-width:min(420px, calc(100vw - 24px));' +
+      'box-shadow:0 3px 14px rgba(0,0,0,.5);white-space:pre-wrap;transition:opacity .4s;cursor:pointer;' +
       // Safari 至今只认带前缀的 -webkit-user-select（MDN BCD），否则连点 HUD 会选中文字。
       '-webkit-user-select:none;user-select:none';
     box.__onClick = event => {
@@ -2451,7 +2451,7 @@
     const buttonStyle = 'min-height:32px;padding:6px 10px;margin:4px 6px 4px 0;cursor:pointer;color:#8cf;background:#25252a;border:1px solid #555;border-radius:4px;font:inherit;-webkit-user-select:none;user-select:none';
     const controls = `<br><button type="button" data-action="probe" style="${buttonStyle}">${probeLabel}${cdnState.pendingProbe?.manual ? '（已排队）' : ''}</button>` +
       `<button type="button" data-action="copy-diag" style="${buttonStyle}">复制诊断 JSON</button>` +
-      '<br><span style="color:#ec9">测速会短暂占用带宽</span>' +
+      '<span style="color:#888;font-size:10px">测速会短暂占用带宽</span>' +
       (diagNote ? `<br><span style="color:#888">${diagNote}</span>` : '');
     if (!hudExpanded) {
       box.innerHTML = conflictPrefix + cdnLine + '<br>' + (bitrateLine ? bitrateLine + '<br>' : '') + codecLine + controls;
@@ -2472,9 +2472,13 @@
         const tag = (result.realSamples ? `融合${result.realSamples}片实测 · ` : '') + (result.note || result.stage);
         const ttfb = Number.isFinite(result.ttfb) ? ` · ${String(result.ttfb).padStart(4)}ms` : ' · TTFB —';
         const banned = isBanned(result.host);
-        const banText = banned ? '已拉黑' : cdnState.rejected.get(cdnState.curKey)?.has(result.host) ? '本视频拒绝' : '未拉黑';
-        let row = `<span data-result-host="${result.host}" data-selected="${result.host === current}">${mark} ${sourceLink(result.host)} <span style="color:${color}">${String(shown).padStart(5)}</span> KB/s${ttfb} <span style="color:#888">${tag} · ${banText}</span></span>`;
-        if (result.points?.length > 1) {
+        const banHtml = banned ? ' <span style="color:#f66">已拉黑</span>'
+          : cdnState.rejected.get(cdnState.curKey)?.has(result.host) ? ' <span style="color:#ec9">本视频拒绝</span>' : '';
+        const hasPoints = result.points?.length > 1;
+        const inlineTag = !hasPoints && tag.length <= 6;
+        let row = `<span data-result-host="${result.host}" data-selected="${result.host === current}">${mark} ${sourceLink(result.host)} <span style="color:${color}">${String(shown).padStart(5)}</span> KB/s${ttfb}${inlineTag ? ` <span style="color:#888">${tag}</span>` : ''}${banHtml}</span>`;
+        if (!inlineTag) row += `<br><span style="color:#777">　↳ ${tag}</span>`;
+        if (hasPoints) {
           row += '<br><span style="color:#777">　↳ ' + result.points.map(point =>
             `${point.point} ${point.kbps || 0}KB/s/${Number.isFinite(point.ttfb) ? point.ttfb + 'ms' : '—'}${point.note ? '(' + point.note + ')' : ''}`
           ).join(' · ') + '</span>';
@@ -2491,9 +2495,13 @@
     }
     const unlisted = compatibleHostPool().filter(host => !shownHosts.has(host));
     if (unlisted.length) {
-      probeRows += '<br>' + unlisted.map(host =>
-        `${host === manual ? '🖐' : host === current ? '✅' : '　'} ${sourceLink(host)} <span style="color:#777">未进入本轮测速 · ${isBanned(host) ? '已拉黑' : '未拉黑'}，可强制尝试</span>`
-      ).join('<br>');
+      probeRows += '<br>' + unlisted.map(host => {
+        const banned = isBanned(host);
+        const banHtml = banned ? ' <span style="color:#f66">已拉黑</span>'
+          : cdnState.rejected.get(cdnState.curKey)?.has(host) ? ' <span style="color:#ec9">本视频拒绝</span>' : '';
+        return `${host === manual ? '🖐' : host === current ? '✅' : '　'} ${sourceLink(host)}${banHtml}` +
+          '<br><span style="color:#777">　↳ 未进入本轮测速，可强制尝试</span>';
+      }).join('<br>');
     }
     if (cdnState.lastResults || unlisted.length) {
       probeRows += manual
@@ -2512,12 +2520,15 @@
       (bitrateLine ? '<br>' + bitrateLine : '') +
       `<br><span data-action="downgrade" style="color:#8cf">跟不上码率时自动降一档：${autoDowngrade ? '开' : '关'}（点击切换）</span>` +
       (bitrateState.downgradeNote ? `<br><span style="color:#888">${bitrateState.downgradeNote}</span>` : '');
-    box.innerHTML = conflictDetails + `<span style="color:#888">CDN 测速${cdnState.lastResults ? '(' + cdnState.lastResults.why + ') · 精测=头部+播放前方，显示有效速度（与真实分片融合）/TTFB' : ''}</span><br>${probeRows}${held}${bitrateInfo}` +
+    box.innerHTML = conflictDetails + `<span style="color:#888">CDN 测速${cdnState.lastResults ? '(' + cdnState.lastResults.why + ')' : ''}</span>` +
+      (cdnState.lastResults ? '<br><span style="color:#777">精测=头部+播放前方 · 速度=融合实测/TTFB</span>' : '') +
+      `<br>${probeRows}${held}${bitrateInfo}` +
       `<hr style="border:0;border-top:1px solid #444;margin:5px 0"><span style="color:#888">编码信息</span><br>` +
       `${codecLine}<br>编码：${codecLabel(codecMime())}<br>powerEfficient：${codecState.efficient == null ? '无法判定（' + (reason || '—') + '）' : codecState.efficient}<br>` +
       `已剔除 AV1：${codecState.stripped} 条<br>B站提供：${offered}` +
       `<hr style="border:0;border-top:1px solid #444;margin:5px 0">` +
-      `<span data-action="codec" style="color:#8cf">编码模块：${codecModeLabel()}（点击轮换）</span><br>` +
+      `<span data-action="codec" style="color:#8cf">编码模块：${codecMode === 'auto' ? '自动' : codecModeLabel()}（点击轮换）</span>` +
+      (codecMode === 'auto' ? `<br><span style="color:#777">　↳ ${codecModeLabel().replace(/^自动｜/, '')}</span>` : '') + '<br>' +
       (codecActive() ? `<span data-action="prefer" style="color:#8cf">编码偏好：${prefer === 'avc' ? 'H.264' : 'H.265'}（点击切换）</span><br>` : '') +
       `<span data-action="hud" style="color:#8cf">HUD：开（点击关闭）</span>` +
       controls +

@@ -890,7 +890,7 @@ async function runManualProbeTests() {
             api.测速结果.list.every(result => rows.some(row => row.dataset.resultHost === result.host &&
               row.textContent.includes(String(result.fusedKbps || result.effectiveKbps || result.kbps || 0)) &&
               row.textContent.includes(String(result.ttfb)))) &&
-            /选择原因：/.test(hud.textContent) && /未拉黑/.test(hud.textContent),
+            /选择原因：/.test(hud.textContent) && /↳/.test(hud.textContent) && !/未拉黑/.test(hud.textContent),
           clean: api.诊断状态.probeControllers === 0 };
       })()`, true);
       addResult(name, Object.values(audit).every(value => value === true) ? 'PASS' : 'FAIL', { reason: JSON.stringify(audit) });
@@ -1937,9 +1937,9 @@ async function main() {
       kind === 'HEVC' ? /编码：HEVC\/H\.265/.test(hud) : kind === 'AVC' && /编码：AVC\/H\.264/.test(hud);
     const efficiencyOk = efficient === true && /🟢 硬解/.test(hud) && /powerEfficient：true/.test(hud);
     const policyOk = targets.av1Hardware
-      ? kind === 'AV1' && /已剔除 AV1：0 条/.test(hud) && /自动｜本机有 AV1 硬解 → 不干预/.test(hud)
+      ? kind === 'AV1' && /已剔除 AV1：0 条/.test(hud) && /编码模块：自动（点击轮换）　↳ 本机有 AV1 硬解 → 不干预/.test(hud)
       : ['HEVC', 'AVC'].includes(kind) && /B站提供：.*AV1/.test(hud) && /已剔除 AV1：[1-9]\d* 条/.test(hud) &&
-        /自动｜本机无 AV1 硬解 → 剔除 AV1/.test(hud);
+        /编码模块：自动（点击轮换）　↳ 本机无 AV1 硬解 → 剔除 AV1/.test(hud);
     const pass = labelOk && efficiencyOk && policyOk;
     addResult('HUD 检查', pass ? 'PASS' : 'FAIL', {
       codec,
